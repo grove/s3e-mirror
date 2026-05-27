@@ -1,570 +1,1013 @@
-# s5mirror — SlateDB Cross-Store Mirroring Tool
+# s5mirror - SlateDB Cross-Store Mirroring
 
-A massively parallel tool that mirrors a SlateDB database from one object
-store to another (e.g. S3 → Azure Blob Storage), keeps the target
-continuously up-to-date with the source, and scales horizontally across
-multiple worker processes.
+This document describes a fault-tolerant, massively parallel Rust system for
+mirroring a SlateDB database from one object-store location to another, such as
+S3 to Azure Blob Storage. It is based on a deeper read of the current SlateDB
+source tree and RFCs in `../slatedb`, especially manifest storage, checkpoints,
+separate WAL stores, WAL reading, garbage collection, clones, and distributed
+compaction.
 
----
+The important correction from the first draft is that a production mirror must
+be designed around SlateDB's real API boundaries. SlateDB exposes useful
+read-side admin APIs today, but most write-side manifest internals are still
+`pub(crate)`. The safest path is therefore either:
 
-## 1. Background: how a SlateDB database is laid out
+1. Add a small public replication/import API to SlateDB and keep `s5mirror` as a
+   standalone crate that uses it.
+2. Start `s5mirror` as a crate inside the SlateDB workspace, or temporarily
+   vendor a schema-level compatibility layer, until those APIs exist.
 
-A SlateDB database is rooted at a single object-store prefix. Every piece of
-durable state is a single object under that prefix:
+The design below treats option 1 as the target architecture and calls out the
+fallbacks explicitly.
 
-| Path | Purpose | Mutability |
+## Executive Summary
+
+SlateDB is unusually mirror-friendly because almost all durable database data is
+stored in immutable object-store files:
+
+- WAL SSTs under `wal/`, identified by monotonically increasing `u64` ids.
+- L0 and sorted-run SSTs under `compacted/`, identified by ULIDs.
+- Sequenced metadata under `manifest/` and `compactions/`, written with
+  create-if-absent semantics.
+- Boundary files under `gc/`, used to prevent stale sequenced metadata writes
+  after GC deletes old metadata files.
+
+The mirror should use a two-phase rule:
+
+1. Copy every object that a chosen source snapshot needs.
+2. Only then publish a target manifest that references those target objects.
+
+That manifest write is the visibility toggle. Before it, copied files are just
+unreferenced bytes. After it, the target database is a valid SlateDB snapshot.
+
+For continuous mirroring, the coordinator repeats this loop: create or refresh a
+source checkpoint, enumerate the checkpoint's file set, enqueue missing objects,
+wait for workers to copy and verify them, then commit a translated target
+manifest. Workers are stateless and scale horizontally by claiming immutable copy
+jobs from a sharded queue stored in the target object store.
+
+## Current SlateDB Facts That Shape the Design
+
+### Object Layout
+
+For a database rooted at `<root>`, the main object store contains:
+
+| Path | Meaning | Notes |
 |---|---|---|
-| `<root>/manifest/NNNNNNNNNNNNNNNNNNNN.manifest` | Sequenced manifest versions (latest id wins) | Immutable; new ids appended via `put_if_not_exists` |
-| `<root>/compactions/NNNNNNNNNNNNNNNNNNNN.compactions` | Sequenced compactor state | Immutable; new ids appended |
-| `<root>/gc/manifest.boundary`, `<root>/gc/compactions.boundary` | GC fencing watermark | Mutable but small |
-| `<root>/wal/NNNNNNNNNNNNNNNNNNNN.sst` | Write-ahead-log SSTs, monotonic `u64` id | Immutable |
-| `<root>/compacted/<ULID>.sst` | L0 + compacted sorted-run SSTs | Immutable |
+| `<root>/manifest/00000000000000000001.manifest` | Manifest version 1 | Sequenced metadata; id comes from the filename. |
+| `<root>/manifest/...` | Later manifests | Latest id is current. |
+| `<root>/compactions/00000000000000000001.compactions` | Compactor state | Also sequenced metadata. |
+| `<root>/gc/manifest.boundary` | Manifest GC boundary | ASCII `u64`. |
+| `<root>/gc/compactions.boundary` | Compactions GC boundary | ASCII `u64`. |
+| `<root>/compacted/<ULID>.sst` | L0 and sorted-run SSTs | Immutable compacted-data files. |
 
-Key invariants that make mirroring tractable:
+The WAL path is logically `<root>/wal/<20-digit-u64>.sst`, but it may live in a
+separate WAL object store configured with `DbBuilder::with_wal_object_store` or
+`AdminBuilder::with_wal_object_store`. The path structure is the same in either
+store.
 
-- All data files (`*.sst`) are **write-once and content-addressable** by their
-  filename. A given `wal/00000000000000000123.sst` or
-  `compacted/01HF…ULID.sst` either does not exist or has the exact bytes that
-  every reader expects forever.
-- The `manifest` is the single source of truth for **which** files are live.
-  GC only deletes files that the latest manifest (and any active checkpoint)
-  no longer references, with a `min_age` grace period.
-- Sequenced metadata uses `put_if_not_exists` CAS plus boundary files
-  (RFC 0026) for fencing — perfect for an OCC writer on the target side.
-- The Rust `object_store` crate already abstracts S3 / GCS / Azure / local /
-  in-memory behind one trait, so the same copy code works for any pair.
-- The `Checkpoint` primitive (RFC 0004) lets us "pin" a consistent view of the
-  source so its GC cannot reclaim files we still need to copy.
+WAL objects can be zero bytes. SlateDB uses zero-byte WAL files as writer-fence
+markers. A mirror must preserve WAL id contiguity, so it must copy zero-byte WAL
+fence objects when they fall in the live WAL range.
 
-These properties give us an embarrassingly parallel copy problem with a tiny
-amount of serialised coordination at the manifest layer.
+### Manifest State
 
-## 2. Goals & non-goals
+`VersionedManifest` is public and exposes enough read-only access to enumerate
+most file references:
 
-### Goals
-1. **Initial bulk copy** of an existing SlateDB database from source to
-   target object store, byte-identical at the file level.
-2. **Continuous tail** keeping the target within seconds of the source.
-3. **Massively parallel** copy of independent files, both within one process
-   (Tokio task pool) and **across many processes** (sharded workers).
-4. **Crash-safe and resumable**: a killed worker, a killed coordinator, or a
-   restarted whole fleet leaves the target in a valid state and resumes
-   without re-copying completed objects.
-5. **Cross-cloud**: S3 ↔ Azure ↔ GCS ↔ local, using only generic
-   `object_store` operations.
-6. **No source modifications** beyond holding a checkpoint and (optionally)
-   listing — the tool is a reader on source and the writer on target.
+- `id()`
+- `l0()` and `compacted()` for the root tree
+- `segments()` for RFC-0024 segmented databases
+- `external_dbs()` for clone/external SST references
+- `next_wal_sst_id()`
+- `replay_after_wal_id()`
+- `checkpoints()`
+- `wal_object_store_uri()` (currently useful only for older V1 manifests; V2
+  decodes this as `None`)
 
-### Non-goals (v1)
-- Cycle-consistent two-way replication.
-- Filtered / projected mirroring (we copy the whole keyspace; SlateDB already
-  has `ProjectionConfig` we could plug in later).
-- Replicating the compactor state file (`*.compactions`) — the target runs
-  no compactor, so it does not need it.
-- Decoding individual KV records — we operate exclusively at the
-  manifest-and-SST file level.
+The manifest's live WAL rule is the same one SlateDB uses for GC:
 
-## 3. High-level architecture
-
-```
-              ┌───────────────────────────────────────────┐
-              │              Coordinator                  │
-              │  (single elected process; fenced by the   │
-              │   target manifest's writer_epoch)         │
-              │                                           │
-              │  ┌─────────────┐    ┌──────────────────┐  │
-              │  │ Source poll │───▶│ Planner / diff   │  │
-              │  └─────────────┘    └────────┬─────────┘  │
-              │                              ▼            │
-              │                     ┌──────────────────┐  │
-              │                     │ Job queue (sharded│  │
-              │                     │  in target store) │  │
-              │                     └────────┬─────────┘  │
-              │                              ▼            │
-              │                     ┌──────────────────┐  │
-              │                     │ Target manifest  │  │
-              │                     │ writer (commits) │  │
-              │                     └──────────────────┘  │
-              └─────────────────┬─────────────────────────┘
-                                │
-        ┌──────────┬────────────┼────────────┬──────────┐
-        ▼          ▼            ▼            ▼          ▼
-    Worker 0   Worker 1     Worker 2    …          Worker N
-   (claims     (claims      (claims                  (claims
-    shard 0,   shard 1,     shard 2,                  shard N,
-    GET/PUT)   GET/PUT)     GET/PUT)                  GET/PUT)
+```text
+wal_id is live iff replay_after_wal_id < wal_id < next_wal_sst_id
 ```
 
-Components:
+The first draft used a vague `last_compacted_wal_sst_id`; the actual field is
+`replay_after_wal_id`.
 
-- **Coordinator** — single fenced process that owns the target manifest. It
-  polls source state, computes deltas, publishes copy jobs, and commits new
-  target manifests once jobs are complete.
-- **Worker** — stateless processes (one or many machines) that claim copy
-  jobs from a sharded queue and stream bytes source → target.
-- **Job queue** — implemented on top of the target object store so that we
-  add **zero external infrastructure** (no Kafka/Redis/Dynamo needed).
+### Public APIs Available Today
 
-A single-process deployment is the same code with `N` workers as Tokio
-tasks in-process and the coordinator running inline.
+Read-side APIs that are useful now:
 
-## 4. Crate layout
+- `Admin::read_manifest(Some(id) | None)`
+- `Admin::list_manifests(range)`
+- `Admin::read_compactions(Some(id) | None)`
+- `Admin::list_compactions(range)`
+- `Admin::read_compactor_state_view()`
+- `Admin::list_checkpoints(name_filter)`
+- `Admin::create_detached_checkpoint(options)`
+- `Admin::refresh_checkpoint(id, lifetime)`
+- `Admin::delete_checkpoint(id)`
+- `WalReader::new(path, wal_object_store)` with `list(range)` and `get(id)`
 
-A Cargo workspace under `s5mirror/`:
+Important APIs that are not public enough today:
 
+- `ManifestStore`, `StoredManifest`, `FenceableManifest`
+- `PathResolver`
+- `Manifest` and `ManifestCore` mutation/encoding
+- `FlatBufferManifestCodec`
+- `TableStore` compacted-SST listing and metadata helpers
+- `ObjectStores` and `ObjectStoreType`
+
+This means a standalone `s5mirror` cannot safely materialize translated target
+manifests using only the current public SlateDB crate. It can read manifests and
+copy object bytes, but it needs new public SlateDB APIs, or a temporary
+schema-level writer, to commit target manifests.
+
+### Checkpoints and GC
+
+Checkpoints pin manifest ids. SlateDB GC preserves manifests and SSTs referenced
+by active checkpoints. A checkpoint can expire; `Admin::refresh_checkpoint` can
+extend it, and `Admin::delete_checkpoint` removes it.
+
+`Admin::create_detached_checkpoint` creates a checkpoint from the latest
+persisted manifest without talking to an in-process writer. `Db::create_checkpoint`
+has stronger source-side semantics when called on the running writer:
+
+- `CheckpointScope::Durable` includes writes already durable at call time.
+- `CheckpointScope::All` attempts to flush current state before checkpointing.
+
+For the fastest possible tail, the mirror should support an optional source
+sidecar or integration path that can call `Db::create_checkpoint` on the live
+writer. Without that, an external-only mirror follows the persisted manifest and
+may lag behind freshly written WAL objects until the source writer persists a
+manifest update.
+
+### Clones and External DBs
+
+SlateDB clones can contain `external_dbs`: compacted SST ids that physically
+live under another database root. A self-contained mirror must resolve each
+`external_db` entry, copy those SSTs into the target's own `compacted/` prefix,
+and emit a target manifest with those references made local.
+
+The current public `CloneBuilder` is not a cross-object-store clone API. It
+clones within one supplied object store. Cross-cloud mirroring needs an export /
+import style API.
+
+## Critique of the Previous Draft
+
+The first plan had the right broad shape, but it was too optimistic in several
+places:
+
+1. It assumed private APIs were reusable from a standalone crate.
+   `ManifestStore`, `PathResolver`, `FenceableManifest`, and the manifest codec
+   are not public.
+2. It treated target manifest writing as solved. Today there is no public API to
+   import a translated manifest into a different object store while preserving
+   SlateDB's sequenced metadata and boundary semantics.
+3. It under-specified WAL freshness. An offline `Admin` checkpoint pins the
+   latest persisted manifest, not necessarily the live writer's newest durable
+   WAL frontier. Fast tailing needs WAL prefetch and, ideally, a source-side
+   checkpoint hook.
+4. It did not account for separate WAL object stores. Source and target config
+   must include both main and WAL stores.
+5. It proposed cross-process multipart uploads using a generic upload id. The
+   `object_store` trait exposes multipart upload as an object, not as a portable
+   serializable upload id. Cross-worker part uploads are backend-specific future
+   work, not a generic v1 feature.
+6. It described job claiming as a rename-like pending to claimed transition.
+   Object stores do not provide atomic rename. The queue must use immutable plan
+   files plus create-if-absent claim markers.
+7. It did not mention target GC. Target GC can delete copied-but-not-yet-
+   referenced files during a large batch. It must be disabled or configured with
+   a min age larger than the worst-case batch duration.
+8. It treated source clone manifests as a minor rewrite. In reality, external
+   SST references require explicit source-path resolution, collision detection,
+   and a choice between self-contained mirroring and preserving external refs.
+9. It implied compactions files should probably be copied. For a readable target
+   they are not required; target compactor resumption is a separate feature.
+10. It over-relied on ETags. ETags are not portable checksums across providers
+    and are often multipart-specific. Verification needs size plus optional
+    checksums, and SlateDB would be better if manifests carried object digests.
+
+The revised design fixes these points.
+
+## Guarantees
+
+### Safety Guarantees
+
+- The target manifest is never advanced until every object it references has
+  been copied and verified in the target store.
+- A crash can leave extra unreferenced objects in the target, but not a manifest
+  that references missing objects.
+- Re-running a batch is idempotent.
+- A stale worker may duplicate work, but it cannot make a committed target
+  snapshot invalid.
+- The source checkpoint is renewed before expiry and is not deleted until the
+  target manifest and mirror state have advanced past it.
+
+### Freshness Guarantees
+
+There are two tail modes:
+
+1. Manifest-following mode: the target catches up to the latest persisted source
+   manifest. This is fully external and works with today's public read APIs plus
+   a manifest import API.
+2. Writer-integrated mode: a source helper asks the live writer to create
+   durable checkpoints periodically. This can expose freshly durable WAL state
+   faster than waiting for natural manifest persistence.
+
+Both modes can prefetch WAL files ahead of the visible manifest to reduce the
+copy backlog. Prefetched WAL objects are not advertised as a target snapshot
+until a source checkpoint or manifest includes their frontier.
+
+## Architecture
+
+```text
+                 source main store         source WAL store
+                        |                        |
+                        v                        v
+                  +-----------------------------------+
+                  |           Coordinator             |
+                  |                                   |
+                  |  checkpoint lease manager         |
+                  |  manifest/compactions reader      |
+                  |  file-set planner                 |
+                  |  batch publisher                  |
+                  |  target manifest importer         |
+                  +-----------------+-----------------+
+                                    |
+                                    v
+                       target-store mirror queue
+                                    |
+                  +-----------------+-----------------+
+                  |                 |                 |
+                  v                 v                 v
+               Worker 1          Worker 2          Worker N
+                  |                 |                 |
+                  +--------- copy and verify ---------+
+                                    |
+                                    v
+                 target main store         target WAL store
 ```
-Cargo.toml                    # workspace
-crates/
-  s5mirror-core/              # types, manifest read/translate, job model
-  s5mirror-copy/              # parallel/multipart file copy primitives
-  s5mirror-coord/             # planner, deltas, manifest commit, source poll
-  s5mirror-worker/            # job claim, copy, ack
-  s5mirror-cli/               # `s5mirror` binary: bulk, tail, worker, status
-```
 
-Key external deps:
+### Coordinator
 
-- `slatedb` (path or pinned version) — re-use `ManifestStore`,
-  `PathResolver`, `Manifest`, `SsTableId`, `FenceableManifest`,
-  `Checkpoint`, error types. We **do not** re-implement the manifest codec.
-- `object_store` — same version as `slatedb` uses.
-- `tokio`, `futures`, `async-trait`, `bytes`.
-- `clap` for the CLI; `tracing` + `tracing-subscriber` for logs;
-  `metrics` + `metrics-exporter-prometheus` for metrics.
-- `serde`, `serde_json` for job descriptors.
-- `ulid`, `uuid`, `chrono`.
+The coordinator owns batch planning and target manifest commits. There should be
+exactly one active coordinator per target database.
 
-## 5. Source-side state we read
+Coordinator responsibilities:
 
-We use the existing SlateDB APIs as a library, not by reimplementing them.
+- Maintain the source checkpoint lease.
+- Read source manifests and compute target file sets.
+- Publish immutable batch plans.
+- Reclaim stale job claims.
+- Wait until all jobs in a batch are done.
+- Translate/import a target manifest.
+- Advance mirror state transactionally.
+- Emit lag and health metrics.
 
-- **List manifests** — `ManifestStore::list_manifests` (returns ids).
-- **Latest manifest id** — already cached behind the boundary file, so this
-  is one conditional GET in the common case.
-- **Read a specific manifest** — `ManifestStore::read_manifest(id)`.
-- **Decode `Manifest`** — gives us `ManifestCore` with:
-  - `core.l0: VecDeque<SsTableView>` — L0 views.
-  - `core.compacted: Vec<SortedRun>` — sorted runs.
-  - segments (each its own `LsmTreeState`).
-  - `next_wal_sst_id`, `last_compacted_wal_sst_id`, `last_l0_seq` etc.
-  - `checkpoints`.
-- **Resolve file paths** — `PathResolver` produces `wal/<id>.sst` and
-  `compacted/<ulid>.sst` paths.
-
-From a single manifest we can compute the **complete set of object keys**
-that the source database currently considers live:
-
-```
-live_files(manifest) =
-      { manifest_path(manifest.id) }
-    ∪ { wal_path(id)        | id ∈ (last_compacted_wal_sst_id .. next_wal_sst_id) }
-    ∪ { compacted_path(sst) | sst ∈ all L0 + all sorted-run SSTs in all segments }
-```
-
-## 6. Source pinning: checkpoints
-
-Before any data is copied we create an **ephemeral checkpoint** on the source
-via `FenceableManifest::write_checkpoint(CheckpointOptions{ lifetime: Some(T),
-… })`. The checkpoint:
-
-- pins a specific source `manifest_id`, so its referenced SSTs cannot be
-  deleted by the source GC;
-- has a finite lifetime that the coordinator **renews on a ticker** (every
-  `lifetime / 3`) for as long as the mirror is running;
-- is replaced periodically by a **fresher** checkpoint as we advance the
-  target manifest — old checkpoints are dropped via
-  `FenceableManifest::delete_checkpoint`.
-
-The checkpoint id is persisted in the target's `mirror/state.json` so a
-restarted coordinator can immediately reattach instead of starting from a new
-checkpoint (which would force a full re-listing).
-
-## 7. Target-side coordination & fencing
-
-The target database is **owned by the mirror**: only the mirror writes
-manifests there. We re-use SlateDB's existing primitives so the target stays
-a valid SlateDB database that any reader/writer can open later.
-
-1. **Open or initialise** the target `ManifestStore`. If empty,
-   `StoredManifest::create_new_db` with `initialized = false` and an empty
-   `ManifestCore`.
-2. **Bump writer epoch** via `FenceableManifest::init_writer(...)`. This
-   gives single-writer fencing for the coordinator across processes —
-   another would-be coordinator that starts up bumps the epoch and the old
-   one's next manifest commit fails with `Fenced` and it exits.
-3. **All target manifest commits go through** `FenceableManifest::update`,
-   which is `put_if_not_exists` against the next manifest id and is
-   automatically guarded by the GC boundary file.
-
-We also keep a `mirror/state.json` (transactional object using the existing
-`SimpleTransactionalObject` machinery in `slatedb-txn-obj`) for our own
-metadata: source path, last replicated source manifest id, source
-checkpoint id, planner generation, current batch id.
-
-## 8. Manifest translation (source → target)
-
-A source manifest references files by `SsTableId` and resolves to physical
-paths via `PathResolver(source_root)`. When we copy a file unchanged to
-`<target_root>/wal/<same id>.sst` or
-`<target_root>/compacted/<same ulid>.sst`, the **`SsTableId`s remain valid**
-on the target — there is no manifest rewriting at the SST-reference level.
-
-What we do change when emitting the target manifest:
-
-- Strip `external_dbs` / clone-source entries — the mirror produces a
-  self-contained DB. If the source itself is a clone, v1 supports it by
-  recursively resolving and copying from the actual underlying paths.
-- Reset `writer_epoch` / `compactor_epoch` to the values the target's
-  `FenceableManifest` requires (it manages them).
-- Drop source-side checkpoints by default (configurable: copy-through).
-- Keep core LSM state, segment state, wal id watermarks, and seq numbers
-  verbatim — they describe data that, by virtue of having been copied, now
-  exists on the target with the same ids.
-
-Target manifest ids are produced monotonically by
-`FenceableTransactionalObject` and have no relationship to source ids.
-
-## 9. The job model
-
-A **Job** is the atomic unit of work for a worker:
+Leader coordination should not depend on target SlateDB writer epochs until the
+target manifest import API exists. Use a dedicated `mirror/lease` transactional
+object in the target store:
 
 ```rust
-#[derive(Serialize, Deserialize)]
-enum Job {
-    CopyObject {
-        job_id: Uuid,
-        kind: ObjectKind,           // Wal | Compacted | Manifest
-        src_path: String,           // object-store path on source
-        dst_path: String,           // object-store path on target
-        expected_size: Option<u64>,
-        // For multipart-split jobs:
-        byte_range: Option<(u64, u64)>,
-        upload_id: Option<String>,
-        part_number: Option<u32>,
-    },
-    FinalizeMultipart {
-        job_id: Uuid,
-        dst_path: String,
-        upload_id: String,
-        parts: Vec<PartId>,
-    },
+struct MirrorLease {
+    holder_id: String,
+    fencing_token: u64,
+    expires_at_ms: u64,
 }
 ```
 
-`Batch` groups jobs that must all finish before the coordinator commits the
-next target manifest:
+The lease is updated with compare-and-swap. Every batch and manifest import
+includes the current fencing token. If the token changes, the old coordinator
+stops before committing anything further.
 
-```rust
-struct Batch {
-    batch_id: Ulid,
-    source_manifest_id: u64,
-    source_checkpoint_id: Uuid,
-    jobs: Vec<Job>,
-}
-```
+Once SlateDB exposes a replication import API, that API should also fence target
+manifest writers using the standard sequenced metadata/boundary protocol.
 
-### Job queue layout (in the target store)
+### Workers
 
-```
+Workers are stateless copy executors. Any worker can process any shard. Shards
+exist to bound list sizes, not to impose fixed ownership.
+
+Worker responsibilities:
+
+- Poll one or more shard prefixes using jitter.
+- Create a claim marker with create-if-absent.
+- Copy the object, possibly using in-process multipart concurrency.
+- Verify the target object.
+- Write a done marker.
+- Heartbeat long jobs.
+
+Workers do not write target manifests and do not mutate mirror state except job
+claim/done/heartbeat markers.
+
+### Target-Store Job Queue
+
+The queue is stored under the target main store, outside the SlateDB database
+layout:
+
+```text
 <target>/mirror/
-  state.json                              (transactional)
+  lease/00000000000000000001.lease
+  state/00000000000000000001.state
   batches/<batch_id>/
-    plan.json                             (immutable; written first)
-    shards/<shard_idx>/
-      pending/<job_id>.json               (created by planner)
-      claimed/<job_id>.<worker_id>.json   (renamed-on-claim marker)
-      done/<job_id>.json                  (created by worker after copy)
-    COMPLETE                              (created when all done counts match)
+    plan.json
+    shards/<shard>/jobs/<job_id>.json
+    claims/<job_id>/<attempt_id>.json
+    heartbeats/<job_id>/<attempt_id>.json
+    done/<job_id>.json
+    failed/<job_id>/<attempt_id>.json
+    COMPLETE
+  tmp/<batch_id>/<job_id>/...
 ```
 
-Claiming a job is a `put_if_not_exists` of the `claimed/` marker (a
-`copy` from `pending/`), then a `delete` of the `pending/` object. If two
-workers race, only one wins the `put_if_not_exists` — the same primitive
-SlateDB uses for manifest CAS.
+There is no rename. A job remains in `jobs/` forever as part of the immutable
+plan. Claiming is:
 
-Shard count `S` is a deployment knob (default: 64). A worker is configured
-with an integer `worker_id`; it owns shards where `shard_idx % world_size ==
-worker_id`. This gives **stateless** workers — add or remove worker
-processes at any time and the rebalance is implicit on the next batch.
+1. Worker reads a job file.
+2. Worker checks whether `done/<job_id>.json` exists.
+3. Worker creates `claims/<job_id>/<attempt_id>.json` with `PutMode::Create`.
+4. If another live claim exists, the worker skips the job.
+5. If the claim is stale, the coordinator can mark it abandoned and allow a new
+   attempt.
 
-## 10. Parallel copy primitive
+Duplicate attempts are harmless because the source object is immutable and the
+job describes the exact source path plus expected metadata.
 
-Every copy job streams source → target. The implementation lives in
-`s5mirror-copy`:
+## Crate Layout
+
+```text
+Cargo.toml
+crates/
+  s5mirror-core/        data model, file refs, state machine, errors
+  s5mirror-slate/       SlateDB adapter: Admin reads, format/import APIs
+  s5mirror-copy/        source-to-target object copy and verification
+  s5mirror-queue/       object-store queue and lease implementation
+  s5mirror-coord/       checkpoint lease, planner, commit loop
+  s5mirror-worker/      worker runtime
+  s5mirror-cli/         binary
+```
+
+The `s5mirror-slate` adapter should support two implementations:
+
+- `slatedb-public-api`: the long-term path, using new public APIs proposed in
+  this document.
+- `schema-compat`: a temporary path that reads/writes FlatBuffer schemas
+  directly and is tested against the exact SlateDB version in use.
+
+The schema-compat path is acceptable for a prototype, but production should
+prefer upstream SlateDB APIs so mirror correctness evolves with the database.
+
+## Data Model
+
+Every planned copy is represented as a fully resolved file reference:
 
 ```rust
-async fn copy_object(
-    src: &dyn ObjectStore, src_path: &Path,
-    dst: &dyn ObjectStore, dst_path: &Path,
-    opts: CopyOpts,
-) -> Result<CopyOutcome>
+enum StoreRole {
+    Main,
+    Wal,
+}
+
+enum FileKind {
+    Manifest,
+    WalSst,
+    CompactedSst,
+}
+
+struct FileRef {
+    kind: FileKind,
+    source_store: StoreRole,
+    target_store: StoreRole,
+    source_path: object_store::path::Path,
+    target_path: object_store::path::Path,
+    source_manifest_id: u64,
+    logical_id: String,
+    expected_size: Option<u64>,
+    expected_version: Option<String>,
+    expected_digest: Option<String>,
+}
 ```
+
+`expected_version` is advisory. It can be an ETag or provider object version.
+It must not be treated as a cross-provider digest. `expected_digest` should be
+used when SlateDB or the source provider supplies a real checksum.
+
+## Enumerating the Source Snapshot
+
+Given a source `VersionedManifest`, enumerate:
+
+1. The manifest object itself:
+
+   ```text
+   main:<source_root>/manifest/<manifest_id:020>.manifest
+   ```
+
+2. Every live WAL object, including zero-byte fence objects:
+
+   ```text
+   for wal_id in (replay_after_wal_id + 1)..next_wal_sst_id
+       wal:<source_root>/wal/<wal_id:020>.sst
+   ```
+
+3. Every compacted SST referenced by:
+
+   - root `l0()`
+   - root `compacted()` sorted runs
+   - each segment's `l0()`
+   - each segment's `compacted()` sorted runs
+
+4. For source clones, resolve compacted SSTs through `external_dbs()`:
+
+   - If an SST id appears in an external DB entry, use that external DB path as
+     the source root for that compacted object.
+   - Copy it into the target's own `compacted/<ULID>.sst` when building a
+     self-contained mirror.
+   - Detect duplicate ids mapping to different source roots. If sizes or
+     checksums differ, fail the batch.
+
+The target paths are always local to the target database root unless the user
+explicitly selects a future "preserve external references" mode.
+
+## Source Checkpoint Protocol
+
+The mirror maintains two source checkpoints:
+
+- `stable_checkpoint`: the source manifest currently committed on the target.
+- `candidate_checkpoint`: the source manifest being copied next.
 
 Algorithm:
 
-1. **HEAD** the destination; if `size` and `e_tag`/`content-length` match
-   the planner's `expected_size`, return `AlreadyPresent` (idempotent
-   resume).
-2. **HEAD** the source for size + ETag.
-3. If `size <= multipart_threshold` (default 16 MiB): one `get` → one
-   `put_if_not_exists` to `dst_path`. The `put_if_not_exists` is the
-   correctness guarantee — a concurrent worker that lost the race observes
-   `AlreadyExists` and treats the job as done.
-4. Otherwise:
-   - `dst.put_multipart(dst_path)` → `MultipartUpload`.
-   - Compute `n = ceil(size / part_size)` parts (default `part_size = 64
-     MiB`, configurable per backend).
-   - Spawn up to `intra_object_parallelism` concurrent tasks, each doing a
-     ranged GET on the source and `put_part` on the destination.
-   - `complete()` the upload.
-   - For **very large** SSTs we can also farm out individual parts as
-     separate `Job::CopyObject{byte_range, upload_id, part_number}` items
-     so they execute on different machines, then a single
-     `Job::FinalizeMultipart` commits the upload.
-5. **Verify**: re-HEAD destination, compare `size` (and `e_tag` when the
-   pair supports comparable hashing — same-cloud copies typically do).
-6. For `*.sst` files, optionally validate by reading the SST footer using
-   `slatedb`'s existing `SsTableFormat`/`SstReader` paths — cheap O(1)
-   bytes near the tail.
+1. If this is the first run, create `stable_checkpoint` and copy it as the
+   initial snapshot.
+2. On each poll, create or refresh `candidate_checkpoint` with a name such as
+   `s5mirror:<target-id>:candidate`.
+3. Read the candidate manifest id from the checkpoint result.
+4. Plan and copy all files required by the candidate manifest.
+5. Import the translated candidate manifest into the target.
+6. Persist mirror state with the new source manifest id and checkpoint id.
+7. Delete the previous stable checkpoint only after step 6 succeeds.
+8. Rename the candidate role to stable in mirror state.
 
-Concurrency knobs:
-- `worker.inter_job_parallelism` — concurrent jobs per worker (default 32).
-- `worker.intra_object_parallelism` — concurrent parts per multipart upload
-  (default 8).
-- Per-backend overrides (S3 vs Azure have different sweet spots).
+If a coordinator crashes, the new coordinator reads mirror state, lists
+checkpoints by name, and conservatively refreshes any mirror-owned checkpoints
+before resuming. It is safe to retain extra checkpoints; the cleanup command can
+delete stale mirror-owned checkpoints after verifying the target no longer needs
+them.
 
-## 11. Bulk (initial) copy
+Checkpoint TTL should be at least:
 
-```
-1. open_or_init_target()                       # writer_epoch bump = fence
-2. create_or_renew_source_checkpoint()
-3. m_src = source_manifest_at(checkpoint)
-4. plan = enumerate_live_files(m_src)
-        - wal SSTs in [last_compacted_wal_sst+1, next_wal_sst)
-        - all L0 + sorted-run compacted SSTs
-        - the chosen source manifest itself (so we know what we copied)
-5. dedupe against any objects already on target (HEAD-based filter
-   in parallel; expected to short-circuit on a fresh target)
-6. write_batch_to_target_store(batch_id, plan)
-7. wait_for_batch_complete(batch_id)           # poll done/ counts
-8. translate_manifest(m_src) → m_dst
-9. fenceable_target.update(m_dst)              # initial committed manifest
-10. mark mirror/state.json with last_source_manifest_id
+```text
+max_expected_batch_duration + coordinator_failover_time + safety_margin
 ```
 
-Within one batch all jobs are independent, so steps 6–7 saturate the
-worker pool. Bulk-copying a multi-TB database is purely network-bound.
+The coordinator refreshes at `ttl / 3`, with jitter.
 
-## 12. Continuous tail
+## Bulk Copy Algorithm
 
-A small loop on the coordinator:
+```text
+1. Acquire target mirror lease.
+2. Ensure target DB is empty or already owned by this mirror.
+3. Create source stable checkpoint.
+4. Read source manifest at the checkpoint's manifest_id.
+5. Enumerate the snapshot file set.
+6. HEAD source objects and enrich FileRefs with size/version metadata.
+7. HEAD target objects and remove already-verified files.
+8. Publish a batch plan under mirror/batches/<batch_id>/.
+9. Workers copy and verify every file.
+10. Coordinator verifies done count and spot-checks target HEADs.
+11. Translate/import target manifest.
+12. Persist mirror state.
+13. Mark batch COMPLETE.
+```
+
+The target manifest is committed only after all referenced files exist in the
+target.
+
+## Continuous Tail Algorithm
+
+```text
+loop every poll_interval with jitter:
+    acquire_or_renew_target_lease()
+    refresh_stable_checkpoint_if_needed()
+
+    candidate = create_or_refresh_candidate_checkpoint()
+    if candidate.manifest_id == state.last_source_manifest_id:
+        continue
+
+    m_candidate = read_manifest(candidate.manifest_id)
+    candidate_files = enumerate_file_set(m_candidate)
+
+    old_files = state.last_committed_file_set
+    delta = candidate_files - old_files
+
+    publish_batch(delta)
+    wait_for_workers(batch)
+    import_translated_manifest(m_candidate)
+    update_state(candidate, candidate_files)
+    delete_old_stable_checkpoint()
+```
+
+Store `last_committed_file_set` or at least a compact digest of it in mirror
+state. This avoids needing to read an old source manifest after a long outage.
+If the stored file set is missing or incompatible, perform a full reconcile:
+enumerate the candidate file set and copy anything missing from the target.
+
+## WAL Prefetch Mode
+
+To keep lag low, workers can copy WAL SSTs before the source manifest catches
+up:
+
+1. Track the highest copied source WAL id for each source WAL store.
+2. Use `WalReader::get(last + 1).metadata()` or bounded `list()` calls to find
+   new contiguous WAL objects.
+3. Copy WAL objects to the target WAL store immediately.
+4. Do not advance the visible target manifest based only on prefetched WALs.
+5. When a later source checkpoint includes those WAL ids in its manifest range,
+   the manifest batch will find the objects already present and commit quickly.
+
+This is a useful RPO/RTO optimization. It does not replace source manifest or
+checkpoint semantics.
+
+## Target Manifest Translation
+
+Target manifest import is the only part that requires stronger SlateDB support.
+
+Desired API shape:
 
 ```rust
-loop {
-    sleep(poll_interval).await;          // e.g. 1–5s
-    refresh_source_checkpoint_if_needed().await?;
+pub struct ReplicationSnapshot {
+    pub source_manifest_id: u64,
+    pub manifest: VersionedManifest,
+    pub file_refs: Vec<ReplicationFileRef>,
+}
 
-    let latest_src_id = source_manifest_store.latest_id().await?;
-    if latest_src_id == state.last_source_manifest_id { continue; }
+pub struct ImportManifestOptions {
+    pub make_self_contained: bool,
+    pub drop_source_checkpoints: bool,
+    pub reset_epochs: bool,
+    pub expected_previous_source_manifest_id: Option<u64>,
+}
 
-    let m_src_new = source_manifest_store.read_manifest(latest_src_id).await?;
-    let m_src_old = source_manifest_store.read_manifest(state.last_source_manifest_id).await?;
-
-    let delta = file_set(m_src_new).difference(&file_set(m_src_old));
-    if delta.is_empty() {
-        commit_target_manifest(m_src_new).await?;     // metadata-only update
-        state.last_source_manifest_id = latest_src_id;
-        continue;
-    }
-
-    let batch = plan_batch(latest_src_id, delta);
-    publish_batch(batch).await?;                       // workers start copying
-    wait_for_batch_complete(batch.id).await?;
-    commit_target_manifest(m_src_new).await?;
-    update_state(latest_src_id).await?;
+impl Admin {
+    pub async fn import_replication_snapshot(
+        &self,
+        snapshot: ReplicationSnapshot,
+        options: ImportManifestOptions,
+    ) -> Result<VersionedManifest, Error>;
 }
 ```
 
-Properties:
+Translation rules:
 
-- **Adds only**: a manifest delta during normal operation is "a few new WAL
-  SSTs and (occasionally) some compacted SSTs". Typical batches are tiny
-  and finish in well under one source flush interval.
-- **Compactions are handled implicitly**: when the source compactor
-  produces a new compacted SST and rewrites the manifest to drop covered
-  L0s, the delta is "new compacted SST" — we copy it; the next target
-  manifest naturally drops the covered L0 refs; the target GC reclaims them
-  after `min_age`.
-- **Source GC safety**: our rolling checkpoint keeps the previous
-  `m_src_old` alive long enough to diff against. If, despite that, the
-  diff manifest is missing (e.g. operator deleted the checkpoint), we fall
-  back to a **full reconcile** (re-enumerate `m_src_new`'s live set and
-  copy anything missing on target).
+- Keep the LSM tree state, segment state, sequence tracker, `last_l0_seq`,
+  `recent_snapshot_min_seq`, `last_l0_clock_tick`, `replay_after_wal_id`, and
+  `next_wal_sst_id` consistent with the source snapshot.
+- Rewrite `manifest_id` to the target sequenced id.
+- Clear source checkpoints by default.
+- Clear `external_dbs` in self-contained mode after all external compacted SSTs
+  have been copied locally.
+- Reset writer and compactor epochs under SlateDB's import/fencing protocol.
+- Preserve `segment_extractor_name`. Target readers/writers must be opened with
+  the same extractor implementation if they later write to the mirrored DB.
+- Preserve format version semantics; V2 must remain V2 when segments exist.
 
-## 13. Failure model & resumption
+The import API must write through SlateDB's sequenced metadata protocol, using
+create-if-absent and boundary checks. It should not perform an overwrite PUT of
+a manifest filename.
 
-| Failure | Effect | Recovery |
+Temporary schema-compat implementation:
+
+- Read raw source manifest bytes from `manifest/<id>.manifest`.
+- Decode with generated FlatBuffer schema files pinned to the SlateDB version.
+- Rewrite the fields above.
+- Encode a new target manifest.
+- Write `manifest/<target_id>.manifest` with `PutMode::Create`.
+- Check and respect `gc/manifest.boundary` like `slatedb-txn-obj` does.
+
+This fallback is version-sensitive and must be tested against every supported
+SlateDB version.
+
+## Copy Primitive
+
+Object copy is deliberately independent of SlateDB record decoding:
+
+```rust
+async fn copy_file_ref(
+    source: &dyn ObjectStore,
+    target: &dyn ObjectStore,
+    file: &FileRef,
+    options: CopyOptions,
+) -> Result<CopyOutcome>
+```
+
+Steps:
+
+1. HEAD the source and compare with the job's expected metadata.
+2. HEAD the target. If size and a trusted digest match, return `AlreadyPresent`.
+3. For small objects, stream source GET to target PUT with create-if-absent when
+   the backend supports it.
+4. For large objects, use one worker process to drive multipart/ranged copy with
+   bounded in-process concurrency.
+5. Write to a temporary key when backend semantics do not allow conditional
+   multipart writes to the final key.
+6. Verify final target size and optional checksum/digest.
+7. Optionally validate SST footer/index using SlateDB public SST APIs when
+   available.
+8. Write the job done marker only after verification succeeds.
+
+Cross-worker multipart uploads are not portable with the generic `object_store`
+trait today. They should be introduced later behind backend-specific adapters
+that expose resumable upload ids or native compose/copy primitives.
+
+## Queue and Batch State Machine
+
+Batch states:
+
+```text
+Planned -> Copying -> Copied -> Importing -> Imported -> Complete
+                    \-> Failed
+```
+
+The batch plan is immutable. Completion is derived from done markers and then
+recorded in mirror state by the coordinator.
+
+Each job attempt has states:
+
+```text
+Unclaimed -> Claimed -> Done
+                    \-> Failed
+                    \-> Abandoned (stale heartbeat)
+```
+
+Stale claim handling:
+
+- Workers heartbeat long jobs at `min(claim_timeout / 3, heartbeat_interval)`.
+- The coordinator lists claims and heartbeats.
+- If no heartbeat is newer than `claim_timeout`, the claim is considered stale.
+- A new attempt may claim the same immutable job.
+- Late completion by a stale attempt is accepted if the copied target object
+  verifies against the job metadata.
+
+This avoids requiring deletes or atomic renames for correctness.
+
+## Failure Handling
+
+| Failure | Safe outcome | Recovery |
 |---|---|---|
-| Worker crashes mid-copy | Partial multipart upload abandoned; pending/claimed job orphaned | TTL-based reclaim: planner moves `claimed/` markers older than `claim_timeout` back to `pending/`. Multipart uploads older than `multipart_ttl` are aborted via `object_store.abort_multipart`. |
-| Coordinator crashes after publishing batch, before commit | Workers finish jobs; new coordinator reads `mirror/state.json` and `batches/<latest>/`, sees `COMPLETE`, performs the deferred `commit_target_manifest` | Idempotent commit. |
-| Coordinator crashes mid-commit | `put_if_not_exists` either succeeded (visible to new coordinator) or did not (new coordinator retries) | `FenceableManifest::maybe_apply_update` handles CAS conflicts. |
-| Two coordinators racing | New one bumped `writer_epoch`; old one's next commit fails `Fenced` and the process exits | Existing SlateDB invariant. |
-| Network blip on a copy | `put_if_not_exists` is idempotent; resumed copy is a no-op | Built into the copy primitive. |
-| Source checkpoint expired | Diff may fail with `ManifestMissing`/`CheckpointMissing` | Full reconcile fallback. |
+| Worker dies before copying | Claim becomes stale | Coordinator allows a new attempt. |
+| Worker dies during multipart | Temp object or abandoned upload remains | Cleanup removes old temp data; job retries. |
+| Worker finishes after being reclaimed | Same immutable bytes may already exist | Verification and done marker are idempotent. |
+| Coordinator dies before import | Files may be copied but unreferenced | New coordinator resumes batch and imports. |
+| Coordinator dies during import | Manifest create either happened or did not | New coordinator reads latest target manifest and retries or advances state. |
+| Source checkpoint expires | Source may GC needed files | Full reconcile if possible; otherwise fail loudly and require a new base snapshot. |
+| Target GC runs during batch | It may delete unreferenced copied objects | Disable target GC during mirroring or set min_age above max batch time. |
+| Two coordinators run | Fencing token changes | Old coordinator stops before commit. |
+| Source clone has conflicting SST ids | Ambiguous bytes for one target key | Fail unless trusted checksums prove identical. |
 
-## 14. Scaling out
+## Target Database Operating Rules
 
-- **Vertical**: each worker is a Tokio runtime with bounded concurrency. A
-  single fat node can drive tens of gigabits with a few hundred concurrent
-  copies.
-- **Horizontal**: launch `N` worker processes anywhere with read access to
-  the source and write access to the target. Each is given a distinct
-  `worker_id` and the global `world_size`. Adding workers requires no
-  coordinator change — they pick up shards on the next batch. Removing them
-  is handled by the claim-timeout reclaim path.
-- **Geographic**: run workers close to either source or target depending on
-  egress pricing; the same binary works either way because both sides are
-  generic `object_store` URIs.
-- **Per-object scale**: huge SSTs are split into byte-range part jobs that
-  flow through the same shard queue, so a single 100 GiB SST does not
-  become a single worker's bottleneck.
+During active mirroring:
 
-## 15. Observability
+- Do not run a SlateDB writer on the target database.
+- Do not run a target compactor unless it is explicitly mirror-aware.
+- Disable target GC or configure conservative retention.
+- Readers are allowed only after the first target manifest is imported. They may
+  observe stale but valid snapshots.
 
-- **Metrics** (Prometheus):
-  - `s5mirror_bytes_copied_total{kind}`
-  - `s5mirror_objects_copied_total{kind}`
-  - `s5mirror_copy_seconds{kind}` (histogram)
-  - `s5mirror_lag_seconds` (target manifest commit time vs. source commit
-    time on the latest replicated source manifest)
-  - `s5mirror_lag_manifests` (count)
-  - `s5mirror_jobs_inflight{worker}` / `pending` / `claimed_stale`
-- **Logs** (`tracing`): structured spans per batch / job, including
-  `batch_id`, `job_id`, `kind`, source/target paths, byte counts.
-- **CLI** subcommands:
-  - `s5mirror status` — current lag, batch state, checkpoint info.
-  - `s5mirror verify` — sample N random keys via SlateDB read API on both
-    sides and compare (separate, slower confidence check).
+At cutover:
 
-## 16. CLI surface
+1. Stop source writes or obtain a final writer-integrated checkpoint.
+2. Copy and import the final source manifest.
+3. Stop the mirror coordinator.
+4. Optionally run target verification.
+5. Open target with the intended writer/compactor/GC configuration.
 
-```
-s5mirror init      --source URL --target URL [--checkpoint-ttl 1h]
-s5mirror bulk      --source URL --target URL --workers N [--world-size W --worker-id I]
-s5mirror tail      --source URL --target URL --poll 2s
-s5mirror worker    --target URL --world-size W --worker-id I
-s5mirror status    --target URL
-s5mirror verify    --source URL --target URL [--sample 10000]
-s5mirror gc        --target URL                # delete orphaned mirror/ artefacts
-```
-
-In single-process mode `bulk` and `tail` start workers internally; in
-multi-process mode they only run the coordinator and you launch
-`s5mirror worker` separately.
-
-## 17. Configuration
-
-A single `s5mirror.toml` (or env vars) for both coordinator and workers:
+## Configuration
 
 ```toml
-[source]
-url = "s3://my-bucket/prod-db"
+[source.main]
+url = "s3://source-bucket/prod-db"
 region = "us-east-1"
 
-[target]
-url = "az://my-container/prod-db-mirror"
+[source.wal]
+# optional; omit to use source.main
+url = "s3://source-wal-bucket/prod-db"
+
+[target.main]
+url = "az://target-container/prod-db"
+
+[target.wal]
+# optional; omit to use target.main
+url = "az://target-wal-container/prod-db"
 
 [mirror]
-checkpoint_ttl   = "1h"
-poll_interval    = "2s"
-shard_count      = 64
-state_path       = "mirror/state.json"
+checkpoint_ttl = "1h"
+poll_interval = "2s"
+lease_ttl = "30s"
+shard_count = 256
+queue_prefix = "mirror"
+mode = "manifest-following" # or "writer-integrated"
+wal_prefetch = true
 
 [worker]
-inter_job_parallelism   = 32
+max_jobs = 64
+max_bytes_in_flight = "4GiB"
 intra_object_parallelism = 8
-multipart_threshold     = "16MiB"
-part_size               = "64MiB"
-claim_timeout           = "10m"
-multipart_ttl           = "24h"
+multipart_threshold = "64MiB"
+part_size = "64MiB"
+claim_timeout = "10m"
+heartbeat_interval = "30s"
 
-[backend.s3]
-# object_store-specific knobs
-[backend.azure]
+[target_gc]
+require_disabled = true
+minimum_safe_min_age = "24h"
 ```
 
-## 18. Testing strategy
+Configuration must include enough information to construct both main and WAL
+object stores. Do not rely on `wal_object_store_uri()` from V2 manifests; it is
+not persisted there today.
 
-1. **Unit tests** for the manifest translator (round-trip translate;
-   prove no clone/external_db references leak through; epochs reset).
-2. **Integration tests** with `InMemory` object stores on both sides:
-   - bulk copy then assert SlateDB reads return identical values for the
-     same key set;
-   - run a writer on the source under load and tail to convergence,
-     comparing scan outputs at stable points;
-   - kill-and-resume scenarios using the existing SlateDB `fail_parallel`
-     fault-injection framework.
-3. **Property tests** for the copy primitive: random sizes incl. exact
-   part boundaries; injected NotFound / AlreadyExists / partial writes.
-4. **Cross-cloud smoke tests** in CI against MinIO + Azurite.
-5. **DST harness reuse**: `slatedb-dst` is a deterministic simulation
-   harness — wire the mirror in to validate convergence under chaos.
+## CLI
 
-## 19. Phased rollout
+```text
+s5mirror init      --config s5mirror.toml
+s5mirror bulk      --config s5mirror.toml
+s5mirror tail      --config s5mirror.toml
+s5mirror worker    --config s5mirror.toml [--shards 0-63]
+s5mirror status    --config s5mirror.toml
+s5mirror verify    --config s5mirror.toml --sample 10000
+s5mirror cutover   --config s5mirror.toml
+s5mirror cleanup   --config s5mirror.toml
+```
 
-1. **Phase 1 — single-process bulk copy.** Coordinator + in-process worker
-   pool. No tail, no multi-process. Validates manifest translation and the
-   copy primitive end-to-end.
-2. **Phase 2 — tail loop.** Add the polling delta loop, rolling
-   checkpoint, and `mirror/state.json` resume.
-3. **Phase 3 — multi-process workers.** Move the job queue onto the
-   target object store and add the claim/done/timeout machinery.
-4. **Phase 4 — per-object splitting.** Byte-range part jobs for very
-   large SSTs.
-5. **Phase 5 — observability + ops.** Metrics, `status` / `verify` /
-   `gc` CLI, runbooks.
-6. **Phase 6 (optional) — projection.** Plug SlateDB's `ProjectionConfig`
-   through so users can mirror only a prefix / key range.
+`bulk` and `tail` can spawn embedded workers for small deployments. Large
+deployments run one coordinator and many independent `worker` processes.
 
-## 20. Open questions
+## Observability
 
-- Should we also replicate `*.compactions` files so that a compactor
-  could be started on the target without recovery cost? (v1: no.)
-- For S3→S3 same-region copies we should detect this and use `CopyObject`
-  (server-side copy) instead of GET+PUT. The `object_store` crate exposes
-  `copy_if_not_exists`; gate this on identical backend + region.
-- Do we want to expose mirror state via a SlateDB-readable transactional
-  object (e.g. as a special manifest annotation) so that downstream tools
-  can introspect lag without parsing our JSON? Probably yes, post-v1.
+Metrics:
 
----
+- `s5mirror_source_manifest_id`
+- `s5mirror_target_manifest_id`
+- `s5mirror_lag_manifests`
+- `s5mirror_lag_seconds`
+- `s5mirror_batch_state{batch_id}`
+- `s5mirror_jobs_total{state,kind}`
+- `s5mirror_bytes_copied_total{kind,source_store,target_store}`
+- `s5mirror_copy_seconds_bucket{kind}`
+- `s5mirror_checkpoint_seconds_until_expiry`
+- `s5mirror_stale_claims_total`
+- `s5mirror_retries_total{reason}`
 
-### Appendix A — minimal trait sketches
+Logs should include `batch_id`, `job_id`, `attempt_id`, `source_manifest_id`,
+`target_manifest_id`, source path, target path, bytes, and verification method.
+
+Status output should show:
+
+- Active coordinator holder and fencing token.
+- Stable and candidate checkpoint ids/expirations.
+- Latest source and target manifest ids.
+- Queue depth by kind.
+- Oldest pending job age.
+- Estimated lag in bytes and manifests.
+
+## Verification
+
+Levels of verification:
+
+1. Object verification: every copied object has expected size and optional
+   digest/checksum.
+2. Manifest verification: every target manifest reference resolves to an object
+   in the expected target store.
+3. SlateDB open verification: open a `DbReader` on the target snapshot.
+4. Data verification: compare sampled point gets or bounded scans between source
+   and target at the same source checkpoint.
+5. Full verification: scan both databases and compare every key/value/tombstone
+   visible at the snapshot. This is expensive and should be optional.
+
+If custom block transformers, merge operators, compaction filters, filter
+policies, or segment extractors are needed to read the data, verification must
+use the same application configuration. The mirror copies bytes; it does not
+automatically know application-level readers.
+
+## Testing Strategy
+
+Unit tests:
+
+- File-set enumeration for root manifests, segmented manifests, WAL ranges, and
+  clone/external DB manifests.
+- WAL range off-by-one tests: copy `(replay_after, next_wal_sst_id)` only.
+- Zero-byte WAL fence preservation.
+- Manifest translation rules.
+- Queue claim and stale-claim state machine.
+- Copy idempotency with duplicate attempts.
+
+Integration tests with `object_store::memory::InMemory`:
+
+- Bulk copy of a simple DB, then open/read target.
+- Bulk copy with separate source and target WAL stores.
+- Continuous tail while source writes and compacts.
+- Source clone made self-contained on target.
+- Target GC disabled/enabled safety tests.
+- Coordinator crash before and after manifest import.
+- Worker crash mid-copy and stale claim recovery.
+
+Cross-provider tests:
+
+- MinIO to Azurite.
+- Local filesystem to MinIO.
+- Same-backend copy fast path if implemented.
+
+Deterministic simulation:
+
+- Reuse `slatedb-dst` patterns for injected object-store faults, delayed lists,
+  stale workers, failover, checkpoint expiry, and CAS conflicts.
+
+Compatibility tests:
+
+- Run schema-compat manifest decode/encode against real SlateDB V1 and V2
+  manifests.
+- Golden files for manifests with segments, projections, external DBs, and
+  sequence trackers.
+
+## Phased Implementation Plan
+
+### Phase 0 - Upstream API RFC/PR
+
+Add or agree on minimal SlateDB public APIs:
+
+- Replication file-set enumeration.
+- Raw or structured manifest export.
+- Safe target manifest import.
+- Public path resolution.
+- Public manifest codec or a `slatedb-format` crate.
+
+This phase removes the largest correctness risk from `s5mirror`.
+
+### Phase 1 - Single-Process Bulk Copy
+
+- Implement source manifest reading through `Admin`.
+- Implement file-set enumeration from public getters.
+- Implement object copy and verification.
+- Implement target import via the new API or schema-compat fallback.
+- No distributed queue yet; use an in-process bounded task pool.
+
+### Phase 2 - Resumable Mirror State
+
+- Add `mirror/state` transactional object.
+- Add source stable checkpoint creation/refresh/delete.
+- Add resume after crash.
+- Add full reconcile mode.
+
+### Phase 3 - Continuous Tail
+
+- Add candidate checkpoints.
+- Add manifest-following tail loop.
+- Add WAL prefetch.
+- Add lag metrics and `status`.
+
+### Phase 4 - Distributed Workers
+
+- Add object-store queue.
+- Add leases and fencing tokens.
+- Add worker processes, claims, heartbeats, stale claim recovery.
+- Add cleanup for temp objects and old batches.
+
+### Phase 5 - Production Hardening
+
+- Cross-provider test matrix.
+- Prometheus metrics.
+- Structured logging.
+- Cutover command.
+- Verification modes.
+- Runbooks for checkpoint expiry and target GC safety.
+
+### Phase 6 - Advanced Features
+
+- Writer-integrated source checkpoint sidecar.
+- Backend-specific distributed multipart for huge single files.
+- Optional preservation of external DB references.
+- Filtered/projection mirroring when SlateDB exposes safe projection APIs.
+- Same-provider server-side copy acceleration.
+
+## Proposed SlateDB Improvements
+
+The mirror becomes much simpler and safer if SlateDB grows the following APIs
+and metadata.
+
+### 1. Public Replication Snapshot API
+
+Expose a stable API that returns a checkpointed snapshot plus all object refs
+needed to materialize it elsewhere:
 
 ```rust
-// s5mirror-core
-pub trait ManifestSource {
-    async fn latest_id(&self) -> Result<u64>;
-    async fn read(&self, id: u64) -> Result<Manifest>;
-    async fn live_files(&self, m: &Manifest) -> Result<BTreeSet<FileRef>>;
-}
-
-pub trait JobQueue {
-    async fn publish(&self, batch: Batch) -> Result<()>;
-    async fn claim(&self, shard: u32, worker_id: u32) -> Result<Option<ClaimedJob>>;
-    async fn ack(&self, job: ClaimedJob) -> Result<()>;
-    async fn reclaim_stale(&self, older_than: Duration) -> Result<usize>;
-    async fn batch_complete(&self, batch_id: Ulid) -> Result<bool>;
-}
-
-pub trait FileCopier {
-    async fn copy(&self, job: &CopyObjectJob) -> Result<CopyOutcome>;
+impl Admin {
+    pub async fn create_replication_snapshot(
+        &self,
+        options: ReplicationSnapshotOptions,
+    ) -> Result<ReplicationSnapshot, Error>;
 }
 ```
 
-These trait boundaries let us:
-- swap the `JobQueue` for a Redis/SQS implementation later without
-  touching workers or coordinator logic;
-- mock everything in unit tests;
-- inject the SlateDB `InstrumentedObjectStore` for metrics on every
-  request, identical to how SlateDB itself instruments object IO.
+The snapshot should include main/WAL store role, paths, ids, sizes, optional
+checksums, and clone/external DB resolution.
+
+### 2. Public Manifest Import API
+
+Expose a safe way to write a target manifest from a snapshot. It should handle
+target manifest ids, epochs, checkpoints, external DB rewriting, FlatBuffer
+versions, and boundary checks.
+
+This is the single most important improvement for a standalone mirror.
+
+### 3. Public Format/Path Crate
+
+Move stable format concerns into a public crate, for example `slatedb-format`:
+
+- `PathResolver`
+- `SsTableId`
+- manifest and compactions codecs
+- schema version constants
+- file-set enumeration helpers
+
+This keeps operational tooling from copying private internals.
+
+### 4. Replication Slots / Leases
+
+Add first-class replication slots that act like named checkpoints with consumer
+progress:
+
+```text
+slot name
+source manifest id
+minimum WAL id needed
+expire time
+consumer metadata
+```
+
+GC would preserve all files needed by active slots. This is more explicit than
+using generic checkpoints for long-running mirrors.
+
+### 5. Writer-Visible Durable Checkpoint Requests
+
+Provide a way for an external admin process to ask the live writer to persist a
+durable checkpoint/frontier, perhaps through an object-store command file or a
+small optional RPC sidecar. This would let mirrors track acknowledged durable
+writes within seconds even when the source would otherwise delay manifest
+persistence.
+
+### 6. Persisted Object Store Descriptors
+
+The separate WAL store RFC notes the difficulty of representing object stores.
+For mirroring and clones, manifests should carry a stable store descriptor or
+store alias for WAL and external DB references. V2 currently drops
+`wal_object_store_uri`, so operators must provide WAL-store mapping out of band.
+
+### 7. Checksums in Manifests
+
+Add optional content digests for SST and WAL objects. ETags are provider- and
+multipart-dependent; real checksums would make cross-cloud verification much
+stronger and cheaper.
+
+### 8. Cross-Store Clone
+
+Generalize clone creation so source and target can have different object stores.
+A cross-store clone is nearly the same primitive as a mirror's initial snapshot.
+
+### 9. Mirror-Aware Target GC Guard
+
+Add an admin guard or lease that tells target GC not to delete mirror-staged
+objects younger than a mirror-owned watermark. This prevents operator mistakes
+during long initial copies.
+
+### 10. Public Compaction Output Visibility
+
+Expose a public helper that returns compaction output SSTs that are safe/unsafe
+to GC. The mirror does not need in-flight outputs for readable snapshots, but
+operational tooling benefits from a stable view of compaction liveness.
+
+## Open Questions
+
+- Should v1 require upstream SlateDB import APIs, or should it ship a pinned
+  schema-compat writer first?
+- Should the target be a self-contained DB by default when the source is a
+  clone? This design says yes, but preserving external references may be useful
+  for cheap local mirrors.
+- How should `s5mirror` discover application-level read configuration for deep
+  verification, especially custom block transformers and segment extractors?
+- Is a source-side RPC sidecar acceptable for low-lag production mirroring, or
+  should all coordination happen through object-store files?
+- Which providers expose checksums and conditional multipart semantics cleanly
+  enough for backend-specific fast paths?
+
+## Bottom Line
+
+The core mirroring strategy is sound: pin a source snapshot, copy immutable
+objects in parallel, then atomically publish a target manifest. The foolproof
+version depends on being precise about WAL ranges, checkpoints, target GC,
+source clones, queue semantics, and SlateDB's current public API boundaries.
+
+The most valuable next step is to add a small SlateDB replication/export/import
+surface. With that in place, `s5mirror` can stay a clean standalone Rust project
+instead of becoming a fragile reimplementation of private SlateDB format logic.
