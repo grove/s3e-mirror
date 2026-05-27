@@ -1,4 +1,4 @@
-# s5mirror
+# s3e-mirror
 
 > A continuously-updated, byte-faithful copy of your [SlateDB](https://slatedb.io) database — in another bucket, another region, or another cloud.
 
@@ -8,7 +8,7 @@
 
 ## What is this, in one sentence?
 
-s5mirror keeps a working copy of your SlateDB database in a second object store — possibly a completely different cloud provider — so that if anything ever happens to the original, you already have a database you can read from and, if you choose, promote to be the new primary.
+s3e-mirror keeps a working copy of your SlateDB database in a second object store — possibly a completely different cloud provider — so that if anything ever happens to the original, you already have a database you can read from and, if you choose, promote to be the new primary.
 
 ## Why would you want that?
 
@@ -16,7 +16,7 @@ Most modern databases that store their data in object storage — SlateDB includ
 
 The standard answer to this problem is to keep a copy of your data somewhere else — somewhere with a different blast radius. A different region is a start; a different cloud provider is much better; a different account in a different cloud, with different administrative credentials, is better still. The trouble is that "keep a copy" is much harder than it sounds for a live database. The database is changing continuously. Files are being added, files are being rewritten in summary form, garbage collection is reclaiming files you might still need to copy, and the *meaning* of the database — which files together constitute "the current state" — is itself recorded in a file that is also being rewritten.
 
-s5mirror exists to do that copying correctly, continuously, and without anyone having to think about it after it has been set up.
+s3e-mirror exists to do that copying correctly, continuously, and without anyone having to think about it after it has been set up.
 
 ## How does it work, conceptually?
 
@@ -28,13 +28,13 @@ That single ordering rule — "data first, then manifest" — is the heart of th
 
 ## A picture that might help
 
-Imagine the source database as a warehouse that only ever receives new boxes. Boxes are never opened and edited; they are stacked on top of existing boxes, and occasionally a forklift consolidates many small boxes into one large box. There is a clipboard at the front door listing exactly which boxes constitute the current official inventory. s5mirror is a fleet of small delivery vans that watches the clipboard, copies every new box to a second warehouse on the other side of the country, and only updates the clipboard at the destination warehouse once every box mentioned on the new version of the clipboard has physically arrived. If a van breaks down halfway through a delivery, the destination warehouse is unaffected: its clipboard still describes a coherent inventory, just a slightly older one. Another van will pick up the delivery and try again. Nothing ever leaves the destination warehouse in a half-updated state.
+Imagine the source database as a warehouse that only ever receives new boxes. Boxes are never opened and edited; they are stacked on top of existing boxes, and occasionally a forklift consolidates many small boxes into one large box. There is a clipboard at the front door listing exactly which boxes constitute the current official inventory. s3e-mirror is a fleet of small delivery vans that watches the clipboard, copies every new box to a second warehouse on the other side of the country, and only updates the clipboard at the destination warehouse once every box mentioned on the new version of the clipboard has physically arrived. If a van breaks down halfway through a delivery, the destination warehouse is unaffected: its clipboard still describes a coherent inventory, just a slightly older one. Another van will pick up the delivery and try again. Nothing ever leaves the destination warehouse in a half-updated state.
 
-## What s5mirror is not
+## What s3e-mirror is not
 
 It is worth being clear about what this tool is not, because the temptation to assume it can do more is real.
 
-**It is not two-way synchronization.** s5mirror copies from a source to a target. If you write to the target while the mirror is active, the mirror will refuse to continue, and rightly so — there is no sensible meaning of "merge these conflicting writes" for a database. If you want a writable target, you first stop the mirror, then open the target for writing. We provide a documented promotion procedure for exactly this.
+**It is not two-way synchronization.** s3e-mirror copies from a source to a target. If you write to the target while the mirror is active, the mirror will refuse to continue, and rightly so — there is no sensible meaning of "merge these conflicting writes" for a database. If you want a writable target, you first stop the mirror, then open the target for writing. We provide a documented promotion procedure for exactly this.
 
 **It is not a replacement for your primary database.** The target database is read-openable at any time — you can run analytics or backups against it — but it is intentionally not the active write path while mirroring is on.
 
@@ -55,7 +55,7 @@ The tool is intentionally something you set up once and then mostly forget about
 
 ## What is the relationship to SlateDB?
 
-s5mirror is an independent tool that builds *on top of* SlateDB. It uses SlateDB's public administrative APIs to read the source database safely, and it writes to the target using ordinary object-store operations. It does not require any patches to SlateDB to work; it does, however, identify a number of improvements to SlateDB that would make replication faster, lower-latency, and simpler — those proposals are in the design document and we intend to contribute them upstream over time.
+s3e-mirror is an independent tool that builds *on top of* SlateDB. It uses SlateDB's public administrative APIs to read the source database safely, and it writes to the target using ordinary object-store operations. It does not require any patches to SlateDB to work; it does, however, identify a number of improvements to SlateDB that would make replication faster, lower-latency, and simpler — those proposals are in the design document and we intend to contribute them upstream over time.
 
 If you are a SlateDB contributor or maintainer reading this, the [DESIGN.md](DESIGN.md) section *How SlateDB Could Help* is the part you will want to read; it is a focused wish list grouped by goal (lower latency, higher throughput, cleaner replication APIs, better safety).
 

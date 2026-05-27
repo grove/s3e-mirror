@@ -1,4 +1,4 @@
-# s5mirror — Cross-Store SlateDB Mirroring
+# s3e-mirror — Cross-Store SlateDB Mirroring
 
 **Status:** Design / RFC, second hardening pass.
 **Audience:** This document is written to be read end-to-end by an engineer who will implement the system, but the opening sections, the section introductions, and the "in plain English" paragraphs are written so that a curious non-technical reader (a product manager, an SRE lead, an executive sponsor) can follow along, understand the trade-offs, and ask sharp questions.
@@ -7,7 +7,7 @@
 
 ## TL;DR
 
-s5mirror is a tool that takes a [SlateDB](https://slatedb.io) database that lives in one object store — say, an Amazon S3 bucket — and keeps a continuously-updated, byte-faithful, **read-openable** copy of it in a completely different object store, possibly in a different cloud provider, a different region, or a different account. It does this without ever asking the source database to slow down, without ever requiring two processes to write to the same database, and without inventing any new on-disk format: the copy is just a normal SlateDB database that any SlateDB reader can open. When the original is healthy, the copy is a cheap insurance policy that costs roughly the bandwidth of the WAL plus a small amount of metadata overhead. When the original is unhealthy — a region outage, a compromised account, a vendor problem — the copy is already a database you can promote and serve from.
+s3e-mirror is a tool that takes a [SlateDB](https://slatedb.io) database that lives in one object store — say, an Amazon S3 bucket — and keeps a continuously-updated, byte-faithful, **read-openable** copy of it in a completely different object store, possibly in a different cloud provider, a different region, or a different account. It does this without ever asking the source database to slow down, without ever requiring two processes to write to the same database, and without inventing any new on-disk format: the copy is just a normal SlateDB database that any SlateDB reader can open. When the original is healthy, the copy is a cheap insurance policy that costs roughly the bandwidth of the WAL plus a small amount of metadata overhead. When the original is unhealthy — a region outage, a compromised account, a vendor problem — the copy is already a database you can promote and serve from.
 
 The design is deliberately conservative. It assumes the network is hostile, that workers crash, that object stores lie about what they have, and that engineers will sometimes misconfigure things. Every committed step is idempotent, every published artifact is named so that two independent workers attempting the same step converge to the same bytes, and every transition from "we copied something" to "the target manifest claims it exists" is gated by a content-level check, not just a file-existed check.
 
@@ -33,9 +33,9 @@ The document is long because mirroring is subtle, but it is also layered so you 
 
 If you run a SlateDB database in production, that database lives inside one object store, owned by one vendor, in one region. That is a single point of failure that no amount of in-database replication can remove: SlateDB is durable because object stores are durable, but if the object store as a whole is unavailable, slow, expensive, compromised, or politically inaccessible (sanctions, lawsuits, billing disputes, account suspension), your database is unavailable too. The standard answer in industry is "make a copy somewhere else." The standard answer is annoyingly hard to do well for an LSM-tree database with a live writer, because the database is a moving target: files are appearing, the manifest is being rewritten, garbage collection is deleting things you might still want, and you cannot just point `rsync` at the bucket and hope.
 
-## What s5mirror Is, In Plain English
+## What s3e-mirror Is, In Plain English
 
-Think of a SlateDB database as a warehouse that only ever receives new boxes — boxes are never edited in place, only stacked on top of older boxes and occasionally consolidated into bigger boxes. The "manifest" is a clipboard at the front door that lists which boxes currently form the official inventory. s5mirror is a fleet of delivery vans that watches the clipboard, copies every box that gets stacked, copies the clipboard updates last, and refuses to update the clipboard at the destination until every box that clipboard mentions is already physically present at the destination. Because the warehouse never edits boxes in place, the copy is always a coherent snapshot. Because we copy box-then-clipboard, the destination is always a valid warehouse — never a half-updated one — even if our vans crash midway.
+Think of a SlateDB database as a warehouse that only ever receives new boxes — boxes are never edited in place, only stacked on top of older boxes and occasionally consolidated into bigger boxes. The "manifest" is a clipboard at the front door that lists which boxes currently form the official inventory. s3e-mirror is a fleet of delivery vans that watches the clipboard, copies every box that gets stacked, copies the clipboard updates last, and refuses to update the clipboard at the destination until every box that clipboard mentions is already physically present at the destination. Because the warehouse never edits boxes in place, the copy is always a coherent snapshot. Because we copy box-then-clipboard, the destination is always a valid warehouse — never a half-updated one — even if our vans crash midway.
 
 ## Why This Works At All
 
@@ -48,7 +48,7 @@ We use the word carefully. We cannot prove the absence of bugs, and we are not c
 1. The **target database is always a valid SlateDB database**, openable read-only at any time, even mid-copy and even if the mirror process is killed with `SIGKILL` at any instruction. There is never a "halfway state" published to the target's manifest.
 2. The **source database is never modified, never blocked, and never has its garbage-collection latency increased** beyond a configurable checkpoint retention window the operator explicitly opts into.
 3. Every committed artifact on the target is **named deterministically** so that two workers racing on the same job produce the same result, and conflicts are resolved by the object store via create-if-absent rather than by application-level locking.
-4. Every operational mistake we have actually been able to think of — bad config, killed worker, paused worker, clock-skewed worker, half-finished multipart upload, partially-failed `CopyObject`, source-GC pressure, target-GC pressure, network partition, accidental dual-mirror — has a documented failure mode in [§ Failure Matrix](#failure-matrix) and a recovery procedure that does not require human reasoning beyond running `s5mirror recover`.
+4. Every operational mistake we have actually been able to think of — bad config, killed worker, paused worker, clock-skewed worker, half-finished multipart upload, partially-failed `CopyObject`, source-GC pressure, target-GC pressure, network partition, accidental dual-mirror — has a documented failure mode in [§ Failure Matrix](#failure-matrix) and a recovery procedure that does not require human reasoning beyond running `s3e-mirror recover`.
 
 That is what we mean by fool-proof, and the rest of this document is the evidence.
 
@@ -493,30 +493,30 @@ redact_manifest_uris = true
 ## CLI
 
 ```text
-s5mirror init     --config s5mirror.toml
-s5mirror plan     --config s5mirror.toml     # dry-run; emits planned bytes & cost
-s5mirror run      --config s5mirror.toml
-s5mirror status   --config s5mirror.toml     # shows lag, queue depth, last commit
-s5mirror verify   --config s5mirror.toml --level 1|2|3|4|5
-s5mirror promote  --config s5mirror.toml     # safe cutover; see § Promotion
-s5mirror recover  --config s5mirror.toml     # idempotent restart helper
+s3e-mirror init     --config s3e-mirror.toml
+s3e-mirror plan     --config s3e-mirror.toml     # dry-run; emits planned bytes & cost
+s3e-mirror run      --config s3e-mirror.toml
+s3e-mirror status   --config s3e-mirror.toml     # shows lag, queue depth, last commit
+s3e-mirror verify   --config s3e-mirror.toml --level 1|2|3|4|5
+s3e-mirror promote  --config s3e-mirror.toml     # safe cutover; see § Promotion
+s3e-mirror recover  --config s3e-mirror.toml     # idempotent restart helper
 ```
 
 ## Observability
 
 The mirror exposes Prometheus-style metrics:
 
-- `s5mirror_source_manifest_id` (gauge)
-- `s5mirror_target_manifest_id` (gauge)
-- `s5mirror_lag_seconds` (gauge; wall-clock between source manifest timestamp and target commit)
-- `s5mirror_lag_manifest_versions` (gauge)
-- `s5mirror_bytes_copied_total` (counter, labeled by `role`)
-- `s5mirror_objects_copied_total` (counter, labeled by `kind`)
-- `s5mirror_copy_errors_total` (counter, labeled by `phase`)
-- `s5mirror_worker_in_flight` (gauge per worker)
-- `s5mirror_queue_depth` (gauge)
-- `s5mirror_checkpoint_age_seconds` (gauge for source-side checkpoint)
-- `s5mirror_egress_bytes_total` (counter; equals the source cloud's bill line item)
+- `s3e-mirror_source_manifest_id` (gauge)
+- `s3e-mirror_target_manifest_id` (gauge)
+- `s3e-mirror_lag_seconds` (gauge; wall-clock between source manifest timestamp and target commit)
+- `s3e-mirror_lag_manifest_versions` (gauge)
+- `s3e-mirror_bytes_copied_total` (counter, labeled by `role`)
+- `s3e-mirror_objects_copied_total` (counter, labeled by `kind`)
+- `s3e-mirror_copy_errors_total` (counter, labeled by `phase`)
+- `s3e-mirror_worker_in_flight` (gauge per worker)
+- `s3e-mirror_queue_depth` (gauge)
+- `s3e-mirror_checkpoint_age_seconds` (gauge for source-side checkpoint)
+- `s3e-mirror_egress_bytes_total` (counter; equals the source cloud's bill line item)
 
 Logs are structured JSON, never include manifest payloads verbatim (the manifest may contain URIs with credentials in older V1 schemas), and are redacted by default.
 
@@ -525,13 +525,13 @@ Logs are structured JSON, never include manifest payloads verbatim (the manifest
 Promoting the target — turning the mirror copy into the active read-write database — is a deliberate operation:
 
 1. **Quiesce the source writer.** If the source is reachable, stop the writer. If the source is unreachable, accept that you may lose any in-flight writes not yet observed by the mirror.
-2. **Drain the mirror.** Run `s5mirror status --wait-quiet` until the target manifest ID equals the source manifest ID (or until you decide to accept the lag).
-3. **Stop the coordinator.** `s5mirror stop --release-lease`. This deletes the lease and writes a `mirror_state/promoted.marker`.
-4. **Verify.** `s5mirror verify --level 3` runs a HEAD-per-file consistency check across the target's last committed manifest.
+2. **Drain the mirror.** Run `s3e-mirror status --wait-quiet` until the target manifest ID equals the source manifest ID (or until you decide to accept the lag).
+3. **Stop the coordinator.** `s3e-mirror stop --release-lease`. This deletes the lease and writes a `mirror_state/promoted.marker`.
+4. **Verify.** `s3e-mirror verify --level 3` runs a HEAD-per-file consistency check across the target's last committed manifest.
 5. **Open the target as a SlateDB writer.** Standard `Db::builder(target_root, target_store).build()`. The target is now the live database.
 6. **(Optional) Re-mirror in the opposite direction.** Treat the original source as the new mirror target. The system is symmetric.
 
-The `promoted.marker` is checked on any subsequent `s5mirror run` invocation; a marker present means an operator must explicitly clear it to restart mirroring, preventing the catastrophic case of resurrecting a mirror against a now-promoted target.
+The `promoted.marker` is checked on any subsequent `s3e-mirror run` invocation; a marker present means an operator must explicitly clear it to restart mirroring, preventing the catastrophic case of resurrecting a mirror against a now-promoted target.
 
 ## Mirror-Aware Target GC
 
@@ -575,7 +575,7 @@ Periodic operational drills: pause workers for 10 minutes, kill the coordinator,
 
 # Part XI — How SlateDB Could Help
 
-This section is a wish list directed at SlateDB upstream. None of the items below are blockers for shipping s5mirror, but each one removes either a category of duplicated code, a category of risk, or a category of polling cost. They are grouped by the goal they serve.
+This section is a wish list directed at SlateDB upstream. None of the items below are blockers for shipping s3e-mirror, but each one removes either a category of duplicated code, a category of risk, or a category of polling cost. They are grouped by the goal they serve.
 
 ## Goal 1 — Reduce Mirror Latency
 
@@ -675,7 +675,7 @@ A documented contract by which the source's GC defers to declared replication sl
 
 ### 17. Native cross-store clone with verification
 
-Today `CloneBuilder` operates within one store. A cross-store variant that internally performed the equivalent of s5mirror's bulk copy with verification, exposed as a single SlateDB operation, would absorb the cold-start half of the mirror's job into the database itself and leave only the continuous-tail layer to external tools.
+Today `CloneBuilder` operates within one store. A cross-store variant that internally performed the equivalent of s3e-mirror's bulk copy with verification, exposed as a single SlateDB operation, would absorb the cold-start half of the mirror's job into the database itself and leave only the continuous-tail layer to external tools.
 
 ---
 
@@ -685,13 +685,13 @@ Today `CloneBuilder` operates within one store. A cross-store variant that inter
 
 We ship in two tracks simultaneously:
 
-- **Track A — Public-API-only** is the path that ships against released SlateDB versions without forking the crate. It uses `Admin`, `WalReader`, `VersionedManifest`, and direct `object_store` access, and reimplements path resolution and FlatBuffer round-tripping in our own `s5mirror-slate` crate against a vendored copy of the schemas. It is what lets us ship v1.
-- **Track B — Upstream-API** lands the requests in [Part XI](#part-xi--how-slatedb-could-help) into SlateDB releases over time. As each lands, the corresponding code in `s5mirror-slate` is deleted in favor of the upstream call.
+- **Track A — Public-API-only** is the path that ships against released SlateDB versions without forking the crate. It uses `Admin`, `WalReader`, `VersionedManifest`, and direct `object_store` access, and reimplements path resolution and FlatBuffer round-tripping in our own `s3e-mirror-slate` crate against a vendored copy of the schemas. It is what lets us ship v1.
+- **Track B — Upstream-API** lands the requests in [Part XI](#part-xi--how-slatedb-could-help) into SlateDB releases over time. As each lands, the corresponding code in `s3e-mirror-slate` is deleted in favor of the upstream call.
 
 ## Phases
 
 - **Phase 0 — Upstream API requests.** File issues against SlateDB for items 1, 2, 7, 11, 12, 13, 15. These are conversations in parallel with implementation, not blockers.
-- **Phase 1 — Read-only source enumeration.** Implement `s5mirror-slate` against the public APIs. Enumerate the source. Produce a plan in dry-run mode. No writes anywhere.
+- **Phase 1 — Read-only source enumeration.** Implement `s3e-mirror-slate` against the public APIs. Enumerate the source. Produce a plan in dry-run mode. No writes anywhere.
 - **Phase 2 — Cold start to local target.** Implement workers, queue, and the bulk-copy path against an `InMemory` and local-disk target. End-to-end tests pass: source database opens, target database opens with identical keys.
 - **Phase 3 — Continuous tail.** Implement the coordinator's polling loop, plan diffing, and incremental commit. Source-rewind detection. Lease and fencing.
 - **Phase 4 — Cross-cloud.** Real S3 and Azure backends. WAL prefetch. Adaptive concurrency. Cost-model instrumentation.
@@ -701,16 +701,16 @@ We ship in two tracks simultaneously:
 ## Crate Layout
 
 ```
-s5mirror-core      Plan/job types, digest, ObjectStore wiring, lease, fencing
-s5mirror-slate     SlateDB layout: path resolution, manifest codec (vendored
-                   from SlateDB schemas), enumeration, manifest translation
-s5mirror-copy      Per-object copy primitive: streaming, multipart, digest,
-                   provider-native fast paths, verification
-s5mirror-queue     Object-store-backed queue: plans, jobs, claims, acks, recovery
-s5mirror-coord     Coordinator: lease, source poll loop, source events,
-                   snapshot planning, commit, GC handshake
-s5mirror-worker    Worker: claim, copy, ack
-s5mirror-cli       `s5mirror` binary with subcommands
+s3e-mirror-core      Plan/job types, digest, ObjectStore wiring, lease, fencing
+s3e-mirror-slate     SlateDB layout: path resolution, manifest codec (vendored
+                     from SlateDB schemas), enumeration, manifest translation
+s3e-mirror-copy      Per-object copy primitive: streaming, multipart, digest,
+                     provider-native fast paths, verification
+s3e-mirror-queue     Object-store-backed queue: plans, jobs, claims, acks, recovery
+s3e-mirror-coord     Coordinator: lease, source poll loop, source events,
+                     snapshot planning, commit, GC handshake
+s3e-mirror-worker    Worker: claim, copy, ack
+s3e-mirror-cli       `s3e-mirror` binary with subcommands
 ```
 
 ---
@@ -722,8 +722,8 @@ These are the questions we do not yet have a confident answer to. Each one is a 
 1. **Manifest commit ordering vs source pace.** If a source publishes new manifests faster than the mirror can copy the underlying files, do we want to commit *every* intermediate target manifest (preserving the source's revision history) or *coalesce* into a smaller number of target manifests (reducing target write amplification at the cost of losing some intermediate states)? Default proposal: coalesce when behind by more than `coalesce_threshold` versions, otherwise mirror 1:1.
 2. **Snapshot retention on the target.** How many old target manifests do we keep? Forever is expensive; only the latest is fragile during readers' open windows. Default proposal: keep the last 24 hours of target manifests, plus any pinned by named checkpoints.
 3. **Mirror-of-mirror.** Can a target serve as the source for *another* mirror? In principle yes — the target is a valid SlateDB database — but the chained replication slot semantics need more thought.
-4. **Promotion symmetry.** When the target is promoted, do we expect operators to reverse the mirror automatically (so the old source becomes the new mirror's target), or is that always a manual decision? Default proposal: manual, with `s5mirror reverse` as a documented convenience.
-5. **Tenancy.** Can one s5mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
+4. **Promotion symmetry.** When the target is promoted, do we expect operators to reverse the mirror automatically (so the old source becomes the new mirror's target), or is that always a manual decision? Default proposal: manual, with `s3e-mirror reverse` as a documented convenience.
+5. **Tenancy.** Can one s3e-mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
 6. **Network egress observability.** Should we ship an opinionated "this is what your cloud bill will look like next month" estimator? It is genuinely useful and operators will ask, but it is also a maintenance burden as cloud pricing drifts. Default proposal: ship a coarse model with caveats, link to the provider's calculator for ground truth.
 7. **Schema upgrade path on SlateDB minor releases.** When SlateDB ships a manifest schema change, the mirror's vendored codec must be updated. We need a CI signal that catches this within hours, not weeks.
 
