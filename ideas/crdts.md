@@ -653,7 +653,7 @@ Informally: compacting today must not change what a replica concludes tomorrow w
 - **Progress compaction.** Per `(replica_id, source_epoch, target_id)`: keep only the highest-HLC fact. Older are strictly dominated.
 - **Counter compaction.** Per `(counter_id, replica_id)`: keep only the highest `value`. Older are strictly dominated.
 
-Compaction itself is performed by a designated coordinator and is published as new immutable summary objects with `PutMode::Create`. Originals are deleted only after the summary is verified by a second replica. Compaction events are themselves recorded in `mirror_state/audit/`.
+Compaction itself is performed by a designated coordinator and is published as new immutable summary objects with `PutMode::Create`. `mirror_state/CHECKPOINT_TIP` is advanced with `PutMode::Update(UpdateVersion { e_tag, version })`, preserving both provider tokens because S3, Azure, and GCS expose different optimistic-locking primitives. Originals are deleted only after the summary is verified by a second replica and the pointer has been conditionally advanced. Compaction events are themselves recorded in `mirror_state/audit/`.
 
 Property tests for compaction (see Testing Strategy) verify the join law on randomized state and delta inputs.
 
@@ -662,9 +662,9 @@ Property tests for compaction (see Testing Strategy) verify the join law on rand
 Even with compaction, the steady-state `LIST mirror_state/` cost grows linearly with active fact count. Two mitigations:
 
 - **Sharded prefixes** (already in the layout): `copy_ledger/by_file/{file_hash_prefix}/...` distributes load across S3 partitions.
-- **Checkpoint pointer.** A `mirror_state/CHECKPOINT_TIP` file (small, periodically rewritten) names the most recent compaction checkpoint. Replicas read the pointer first, load the checkpoint, then list *only* events newer than the checkpoint's HLC. This collapses cold-restart from "list everything" to "load one checkpoint plus a small recent tail."
+- **Checkpoint pointer.** A `mirror_state/CHECKPOINT_TIP` file (small, periodically rewritten with `PutMode::Update(UpdateVersion)`) names the most recent compaction checkpoint. Replicas read the pointer first, load the checkpoint, then list *only* events newer than the checkpoint's HLC. This collapses cold-restart from "list everything" to "load one checkpoint plus a small recent tail."
 
-The checkpoint pointer is racy (rewritten in place) but tolerable because the checkpoint files themselves are immutable and the pointer is only a hint. If the pointer is stale or wrong, the worst case is reading slightly more events than necessary; correctness is unaffected.
+The checkpoint pointer is race-protected but still only a hint. If two compactors race, exactly one conditional update wins; the loser re-reads the pointer, verifies the winning checkpoint is at least as recent, and discards its candidate. If the pointer is stale because an update failed, the worst case is reading slightly more events than necessary; correctness is unaffected because checkpoint files are immutable and every tail fact is still mergeable.
 
 ## Schema Versioning And Forward Compatibility
 

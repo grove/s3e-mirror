@@ -94,6 +94,20 @@ A SlateDB **checkpoint** is a logical pin on a specific manifest version. As lon
 
 The checkpoint TTL is the only operationally visible cost the mirror imposes on the source: a longer TTL means more headroom for slow mirroring, but it also means GC keeps more data alive on the source for longer. We default to a small multiple of the expected end-to-end snapshot lag, and we make this explicit in the configuration in [§ Configuration](#configuration).
 
+## GC Boundary Markers and Enumeration Order
+
+SlateDB also writes GC boundary markers such as `gc/manifest.boundary` and `gc/compactions.boundary` to fence stale writers after old sequenced files have been removed. The mirror treats these as source-side safety signals.
+
+Correct enumeration order:
+
+1. Create or refresh the source checkpoint.
+2. Read the pinned manifest and compute the live set of WAL, compacted, manifest, compaction, checkpoint, and external-db files.
+3. List/fetch the live files.
+4. Read GC boundary markers **after** listing.
+5. If a required file is missing and the relevant boundary advanced during the enumeration window, abort the snapshot and retry from a fresh checkpoint. If the checkpoint still claims to protect the file, escalate as a source GC contract violation.
+
+Reading boundaries before listing is weaker: GC could advance between the boundary read and the file listing, producing a false sense of safety. Reading them after listing turns the race into a detectable abort.
+
 ## Clones and external_dbs
 
 SlateDB supports **clones**: a database can declare in its manifest that some of its files actually live at a different root path, by listing those references in an `external_dbs` field. The clone reader resolves these transparently. The mirroring design uses this in a focused, controlled way for compacted SSTs that originated in the source: see [§ Target Manifest Translation](#target-manifest-translation). External DB resolution must be carefully designed so that the target does not accidentally depend on the source being reachable forever.
@@ -101,6 +115,16 @@ SlateDB supports **clones**: a database can declare in its manifest that some of
 ## WAL Fences and Zero-Byte Files
 
 Sometimes a SlateDB writer crashes and a new writer takes over. The new writer cannot tell from the manifest alone exactly which WAL ID the old writer had reserved, so it uses a **fence**: it writes a zero-byte object at the next plausible WAL ID via `PutMode::Create`. If the create succeeds, the new writer knows it has fenced out any zombie writer; if it fails because the ID already exists, the new writer advances and tries again. From the mirror's point of view, those zero-byte files are part of the source's truth and **must** be preserved verbatim on the target. A mirror that "optimizes" them away will silently break the target's fencing protocol on promotion.
+
+Fence handling rules:
+
+- A file is treated as a WAL fence only if `size == 0` and the path matches the WAL SST naming pattern inside the live WAL interval `(replay_after_wal_id, next_wal_sst_id)`.
+- Zero-byte WAL-looking files outside the live interval are not copied as part of the current snapshot; source GC owns them.
+- Copying a fence uses the same `PutMode::Create` path as any other WAL file, with empty bytes and the deterministic empty digest.
+- Promotion runs `verify-fences`: for the target's latest manifest, enumerate the live WAL interval and verify every zero-byte source fence appears on the target with size 0.
+- A missing fence aborts promotion even if all non-empty SSTs verify, because promotion must preserve SlateDB's writer-fencing history.
+
+Metric: `s3e_mirror_wal_fence_files_copied_total`.
 
 ---
 
@@ -154,6 +178,26 @@ The two-phase rule has three corollaries:
 - A mirror process killed at any instruction restarts cleanly because any half-copied state is either named in a way that lets it be discovered (workers' claim markers, in-flight upload directories) or named in a way that lets it be safely overwritten on retry (the destination object name is content-deterministic).
 - We never need a "rollback" path on the target. There are only two states: "manifest committed and complete" and "manifest not yet committed." There is no in-between.
 
+## Determinism Contract
+
+The second most important safety property is **determinism**. For a fixed tuple `(source_epoch, candidate_source_manifest_id, target_predecessor_manifest_id, mirror_config_digest)`, every coordinator replica MUST compute identical:
+
+1. `Plan` bytes,
+2. `plan_digest = blake3-256(canonical-plan-bytes)`,
+3. translated target manifest bytes,
+4. `target_manifest_digest = blake3-256(target-manifest-bytes)`.
+
+The deterministic input set is deliberately narrow: source manifest bytes, source root identifiers, target root identifiers, mirror configuration digest, resolved external-db descriptors, the previous target manifest digest, and the sorted file-reference set. Runtime values such as worker IDs, claim IDs, wall-clock timestamps, process start time, event arrival order, object-store listing page boundaries, and hash-map iteration order are forbidden inputs to plan or manifest bytes.
+
+Rules:
+
+- **Canonical plan bytes:** plans are serialized as RFC 8785 canonical JSON: UTF-8 lexical map ordering, deterministic array ordering, no insignificant whitespace, normalized numbers. `files` are sorted by `(role, source_root, logical_path, kind, expected_size, expected_digest)`.
+- **Pinned FlatBuffer encoding:** manifest translation uses one vendored/pinned `slatedb-format` schema adapter per source manifest version. Generated code version is part of the `mirror_config_digest`. Multi-coordinator manifest races are disabled for any schema version whose encoder has not passed golden-byte determinism tests.
+- **Digest metadata:** the target manifest object stores `s3e-plan-digest`, `s3e-target-manifest-digest`, `s3e-source-manifest-id`, `s3e-source-manifest-digest`, `s3e-mirror-version`, and `s3e-config-digest` as object metadata. On takeover, same-bytes race, or audit, the coordinator re-computes these values and compares before committing any later manifest.
+- **Fail closed:** a mismatch in plan digest, target manifest digest, source manifest digest, or config digest is a determinism violation. The mirror halts, refuses further target commits, records an audit event under `mirror_state/audit/`, and requires operator intervention.
+
+This is what makes future multi-coordinator HA safe: `PutMode::Create` picks the winner, but determinism proves that all honest coordinators were trying to publish the same bytes.
+
 ## The Lease Model
 
 Exactly one mirror process at a time may publish manifests to a given target root. We enforce this with a sequenced **mirror lease** file at `mirror_state/lease/000…N.lease`, written with `PutMode::Create`. A lease declares a `holder_id`, a `fencing_token` (the lease's own ID `N`), and an `expires_at_ms` wall-clock deadline. A coordinator MUST renew its lease before any manifest commit; a worker MUST include its coordinator's fencing token in every claim marker. A second coordinator can take over after the deadline has passed by writing the next sequenced lease; subsequent manifest commits gated on stale tokens are then refused.
@@ -196,9 +240,10 @@ The mirror writes only to its own target root, and within that root it writes to
 | Coordinator crash mid-snapshot                | lease expires                              | none on target (no manifest committed)  | next coordinator takes lease, replays plan |
 | Coordinator publishes lease, never commits    | manifest ID gap visible to monitor         | none                                    | next coordinator resumes from last committed manifest |
 | Source GC pressure exceeds checkpoint TTL     | mirror detects missing source file         | snapshot aborts                         | retry from a fresh checkpoint with longer TTL |
+| Source GC boundary advances during enumeration | post-list boundary read crosses required file | snapshot aborts; target unchanged   | retry from fresh checkpoint; alert if checkpoint should have protected it |
 | Target GC running externally                  | mirror's pre-flight check fails            | mirror refuses to start                 | operator removes external GC |
 | Source rolled back to older manifest          | new candidate manifest ID < last mirrored  | snapshot aborts; alarm raised            | operator confirms intent; mirror restarts from new tip |
-| Manifest schema version mismatch              | parser returns version field               | mirror logs and round-trips faithfully  | none; the source's schema is the source of truth |
+| Manifest schema version mismatch              | parser returns version > `manifest_max_version` | mirror halts before planning       | upgrade mirror or downgrade source; fail closed |
 | Two mirrors targeting same target             | second mirror's lease create-if-absent fails | second mirror exits                    | operator picks one; revoke other |
 | Cross-region partial failure mid-copy         | per-object verification fails              | retry with backoff                      | adaptive concurrency throttles |
 | Workers in wrong region (cost escalation)     | observability alerts on egress             | alarm; no correctness issue             | operator moves workers |
@@ -207,9 +252,15 @@ The mirror writes only to its own target root, and within that root it writes to
 | Two coordinators compute different bytes for same manifest ID | losing create fails; bytes mismatch on read | mirror halts; alarm | operator investigates determinism bug |
 | Forged ack from compromised worker            | coordinator HEAD-verifies pre-commit       | snapshot aborts                         | revoke worker creds; audit `mirror_state/audit/` |
 | CRDT control-plane schema-version skew        | document carries unknown `schema_version`  | document isolated; metrics rise         | upgrade replicas |
-| CRDT state listing too slow                   | `crdt_state_object_count` exceeds threshold | latency degrades                       | trigger compaction; refresh `mirror_state/CHECKPOINT_TIP` |
-| Checkpoint pointer race (two compactors)       | If-Match ETag fails on CHECKPOINT_TIP      | losing compactor discards its checkpoint; no visible effect | retry from step 1; verify winning checkpoint is at least as recent |
+| CRDT state listing too slow                   | `s3e_mirror_crdt_state_object_count` exceeds threshold | latency degrades              | trigger compaction; refresh `mirror_state/CHECKPOINT_TIP` |
+| Checkpoint pointer race (two compactors)       | `PutMode::Update(UpdateVersion)` fails on `CHECKPOINT_TIP` | losing compactor discards its checkpoint; no visible effect | retry from step 1; verify winning checkpoint is at least as recent |
 | Checkpoint pointer regresses to older snapshot | coordinator reads newer than pointer       | cold restart reads longer tail than necessary | compactor detects and corrects on next run; correctness unaffected |
+| Conditional write conflict (`AlreadyExists` / `Precondition`) | `object_store` error taxonomy             | expected race, no corruption            | read existing object, compare digest/metadata; continue if same bytes, halt if mismatch |
+| Conditional write transient (`429`, `503`, provider `409`) | provider error code; retry budget          | commit delayed, target remains valid     | exponential/AIMD backoff; restart multipart uploads where provider requires it |
+| Unknown SlateDB manifest schema version        | manifest parser returns version > known    | mirror halts before planning             | upgrade mirror or downgrade source; no guessed translation |
+| Promotion verification fails                   | `verify --level 3` reports missing/mismatch | target remains read-only mirror          | repair or abort promotion; `promoted.marker` is not written |
+| Event channel drops or reorders messages        | polling observes source tip independently  | freshness degrades only                  | fall back to polling; alert on stale event stream |
+| WAL fence missing at target during promotion   | `verify-fences` finds missing zero-byte WAL | promotion aborts                         | repair by copying fence; re-run promotion verify |
 
 ---
 
@@ -286,7 +337,7 @@ File layout, with the CRDT type backing each subtree:
 - `mirror_state/repairs/observations/{target_id}/{file_hash}/{event_id}.json` — **OR-Map** of repair observations from auditors; workers consume these as ordinary copy jobs.
 - `mirror_state/counters/{counter_id}/{replica_id}.json` — **G-Counter** / **PN-Counter** slots; global value is the sum across replicas.
 - `mirror_state/audit/{event_id}.json` — **G-Set** of operator and compaction audit events; never compacted within retention window.
-- `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Updated by the compactor with an **If-Match ETag conditional write** after the checkpoint is verified by a second replica, preventing two compactors from racing to an older pointer. Staleness is safe; a lagging pointer means reading a longer tail, not wrong answers.
+- `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Updated by the compactor with `PutMode::Update(UpdateVersion { e_tag, version })` after the checkpoint is verified by a second replica, preventing two compactors from racing to an older pointer. Staleness is safe; a lagging pointer means reading a longer tail, not wrong answers.
 - `mirror_state/schemas/v{N}.json` — JSON-Schema documents per CRDT schema version; new fields are additive within a version, breaking changes bump `N`.
 - `mirror_state/lease/000…N.lease` — sequenced single-publisher lease (unchanged from earlier description).
 
@@ -413,6 +464,14 @@ When the coordinator decides to take a new snapshot, it does so in four ordered 
 
 The mirror holds at most two checkpoints on the source at any time: a **stable_checkpoint** pinning the manifest version we have already mirrored to the target, and a **candidate_checkpoint** pinning the version we are currently mirroring. As soon as we commit a candidate to the target, we promote candidate to stable and refresh; once promotion is safely durable, we delete the previous stable. This double-buffering means a coordinator crash at any moment leaves the source with at most one extra checkpoint, never zero.
 
+Checkpoint TTL is a safety budget, not a performance hint. Default:
+
+```text
+checkpoint_ttl_secs = max(3600, p99_snapshot_copy_seconds * 5)
+```
+
+The mirror refreshes the candidate checkpoint when age reaches 50% of TTL and alerts at 80%. If checkpoint age reaches 100%, the mirror stops planning new snapshots, refreshes the checkpoint first, and only resumes once the source confirms the pin. If a source file is missing while a checkpoint claims to protect it, the mirror treats this as a source-side GC contract violation and aborts the snapshot; it never papers over the gap by committing a partial target manifest.
+
 ## Bulk Copy Algorithm (Cold Start)
 
 A cold start is the special case where no target manifest exists yet. The algorithm is the same as a snapshot delta, but every file in the snapshot is in the diff. We additionally:
@@ -426,18 +485,43 @@ A cold start is the special case where no target manifest exists yet. The algori
 loop {
     let event = wait_for_source_event(poll_interval, event_subscription);
     let candidate = source.read_latest_manifest()?;
-    if candidate.id <= last_mirrored_manifest_id { continue; }
-    if candidate.id <  last_mirrored_manifest_id { raise_rewind_alarm(); abort; }
-    let plan = plan_delta(last_mirrored, candidate)?;
+    let last_source_id = target_metadata.last_committed_source_manifest_id;
+    if candidate.id <  last_source_id { raise_rewind_alarm(); abort; }
+    if candidate.id == last_source_id { continue; }
+    let plan = plan_delta(target_metadata.last_source_manifest, candidate)?;
     enqueue(plan);
     wait_all_jobs_acked(plan)?;
     verify_target_has_all(plan)?;          // belt + suspenders
-    commit_target_manifest(translate(candidate))?;
+    commit_next_target_manifest(translate(candidate), source_manifest_id = candidate.id)?;
     advance_checkpoints();
 }
 ```
 
 The `wait_for_source_event` is the union of (a) a periodic poll bounded by `manifest_poll_interval`, and (b) an event subscription, when configured, that wakes the coordinator the moment a new `manifest/*.manifest` lands. See [§ Event-Driven Tail](#event-driven-tail).
+
+## Plan Coalescing and Backpressure
+
+When the source publishes manifests faster than the mirror can copy, the mirror does not blindly create one target manifest per source manifest forever. It uses a deterministic coalescing policy:
+
+```text
+lag_versions = latest_source_manifest_id - last_committed_source_manifest_id
+backlog_bytes = sum(bytes for jobs not yet copied)
+
+if lag_versions <= coalesce_threshold_versions
+   AND backlog_bytes <= coalesce_threshold_bytes:
+    mirror the next source manifest 1:1
+else:
+    coalesce: plan directly from last committed target manifest to latest source manifest
+```
+
+Coalescing preserves the latest database state but intentionally skips intermediate target manifests. This is safe because the target manifest remains a valid prefix endpoint: all files referenced by the coalesced target manifest are copied before commit. It is also deterministic because the decision uses only source manifest IDs, target manifest IDs, and backlog bytes derived from CRDT state.
+
+Rules:
+
+- The mirror records `coalesced_source_range = (first_skipped_manifest_id, latest_source_manifest_id)` in the plan and target manifest metadata.
+- Coalescing is disabled during promotion drain unless the operator passes `promote --force --accept-coalescing`.
+- If a user requires full target revision history, set `coalesce_threshold_versions` to a very large value and size workers/checkpoint TTL accordingly.
+- Metrics: `s3e_mirror_manifests_coalesced_total` and `s3e_mirror_plan_churn_ratio`.
 
 ## WAL Prefetch Mode
 
@@ -465,6 +549,21 @@ struct ImportManifestOptions {
 }
 ```
 
+## Manifest Schema and Encoding Contract
+
+SlateDB manifest schemas are part of the mirror's safety boundary. The mirror does **not** guess how to translate an unknown manifest version.
+
+Rules:
+
+1. **Version detection first.** Read the manifest version before decoding any version-specific fields.
+2. **Known version required.** If `source_manifest_version > manifest_max_version`, the mirror halts with a non-retryable schema error. Operator choices are: upgrade the mirror, downgrade the source, or disable mirroring.
+3. **Same version out.** Target manifests preserve the source manifest version. A V1 source produces a V1 target; a V2 source produces a V2 target.
+4. **No unknown-field promises.** FlatBuffers do not give the mirror a portable way to parse and re-emit fields from a future schema it does not know. Therefore `tolerate_unknown_fields = false` by default for manifests. Forward compatibility for CRDT control-plane JSON is separate and does allow unknown-field pass-through.
+5. **Golden-byte corpus.** For every supported SlateDB minor version, the repository stores a corpus of source manifests and expected translated target manifests. Any change to the vendored schema, FlatBuffer builder, path translation, or default-field handling must pass this corpus before release.
+6. **Rolling upgrade safety.** A running coordinator writes `s3e-mirror-version` and `s3e-config-digest` into plan and manifest metadata. During a rolling upgrade, old and new coordinators may both observe and plan, but only manifests whose metadata matches the active config digest may be committed. A config/schema mismatch is a determinism violation, not a retryable conflict.
+
+Schema tests run in both directions: mirror V_old source with V_new mirror, and mirror V_new source with V_old mirror. The expected V_new -> V_old outcome is fail-closed before planning, not partial mirroring.
+
 ---
 
 # Part VII — Object Copy Internals
@@ -479,11 +578,28 @@ When source and target are different (the interesting case for cross-cloud mirro
 
 All three major clouds now support create-if-absent at the object-store API level: S3 since November 2024 supports `If-None-Match: *`, Azure has supported it for years, and GCS has supported `ifGenerationMatch: 0` for years. The `object_store` crate exposes this as `PutMode::Create` portably. The design uses this primitive **everywhere a uniqueness invariant matters**: lease files, claim markers, ack markers, manifest commits, plan files, and individual SST writes that name files we believe are not yet there. We never use ETags to enforce mutual exclusion across backends; we use the upload semantics themselves.
 
+Provider-specific semantics matter enough to state explicitly:
+
+| Provider | Create-if-absent primitive | Update-if-current primitive | Expected conflict | Retryable transients | Notes |
+| --- | --- | --- | --- | --- | --- |
+| S3 | `If-None-Match: *` on PUT / CopyObject / CompleteMultipartUpload | `If-Match` on current ETag | 412 Precondition Failed; sometimes 409 Conflict around concurrent deletes | 409 (retry; restart multipart if needed), 429/503 with backoff | S3 ETag is a version token here, not a content hash; content integrity uses mirror digests. |
+| Azure Blob | `If-None-Match: *` / blob create conditions | `If-Match` on current blob ETag | 412 Precondition Failed | 429/503 with backoff | Azure ETag is an opaque version identifier updated on writes. |
+| GCS | `ifGenerationMatch=0` | generation/metageneration match; `object_store` preserves both through `UpdateVersion` | 412 Precondition Failed | 429/503 with backoff | Prefer generation/metageneration over ETags; GCS ETags are not the strongest version token across APIs. |
+| Local/InMemory | atomic create in adapter | adapter-specific `UpdateVersion` | `AlreadyExists` / `Precondition` | n/a | Test adapters must simulate conflict ordering and retryable errors. |
+
+The mirror classifies conditional-write results into exactly three buckets:
+
+1. **Expected conflict** (`AlreadyExists` / `Precondition` / provider 412): read the existing object, compare digest and metadata. If bytes and required metadata match, continue. If they differ, halt with determinism violation.
+2. **Retryable transient** (429, 503, provider-specific 409, network timeout before response): retry with exponential/AIMD backoff. For multipart completion conflicts, abort and restart the multipart upload, because providers may not let an already-started multipart commit be made conditional after the fact.
+3. **Fatal provider error** (auth failure, unsupported precondition, malformed request, unknown schema): halt and require operator action.
+
+The mirror never treats a conditional-write failure as success unless it has read the existing object and proven same bytes plus same required metadata.
+
 ## Optimistic Locking Protocol
 
-Beyond `PutMode::Create`, three operations use **If-Match ETag** conditional writes to close races that create-if-absent alone cannot prevent.
+Beyond `PutMode::Create`, three operations use `PutMode::Update(UpdateVersion { e_tag, version })` conditional writes to close races that create-if-absent alone cannot prevent. `UpdateVersion` preserves both ETag and provider version because stores use different combinations: S3 and Azure rely on ETags, while GCS is strongest with generation/metageneration.
 
-### 1. Checkpoint pointer updates (If-Match)
+### 1. Checkpoint pointer updates (UpdateVersion)
 
 `mirror_state/CHECKPOINT_TIP` is a mutable pointer updated after every compaction. Without a conditional write, two compactors could interleave:
 
@@ -496,10 +612,8 @@ compactor_1 updates CHECKPOINT_TIP to A   ← older checkpoint wins; B is orphan
 The correct protocol:
 
 ```rust
-// Step 1: read current pointer and its ETag
-let (old_tip, etag) = object_store
-    .get_opts("mirror_state/CHECKPOINT_TIP", GetOptions { if_match: None, .. })
-    .await?;
+// Step 1: read current pointer and provider version token.
+let tip = read_checkpoint_tip_with_update_version().await?;
 
 // Step 2: write and verify compaction checkpoint (unchanged)
 write_and_verify_checkpoint(checkpoint_id).await?;
@@ -509,7 +623,7 @@ object_store
     .put_opts(
         "mirror_state/CHECKPOINT_TIP",
         Bytes::from(checkpoint_id.to_string()),
-        PutOptions { mode: PutMode::Update(UpdateVersion { e_tag: Some(etag), .. }), .. },
+        PutOptions { mode: PutMode::Update(tip.update_version), .. },
     )
     .await
     .map_err(|_| CheckpointRace)?;  // retry from step 1 on conflict
@@ -614,6 +728,20 @@ Polling-only freshness is bounded by `manifest_poll_interval` (default 5 seconds
 
 Events are **purely a wake-up signal**. The coordinator always reads the actual manifest list to determine truth; events that arrive out of order or get duplicated cannot affect correctness, only latency. Polling remains on as a fallback so that a misconfigured or temporarily-broken event channel only degrades freshness, never breaks the mirror.
 
+### Event Delivery Contract
+
+Source events are at-least-once and unordered. The mirror assumes duplicates, delays, loss, and provider-specific batching.
+
+Rules:
+
+1. **Truth comes from the source store, never the event payload.** On every event or poll tick, the coordinator reads the source tip by `manifest/CURRENT` if available (future upstream request), otherwise by listing `manifest/` and selecting the highest valid manifest.
+2. **Deduplication is an optimization only.** The event loop keeps a five-minute HLC window keyed by `(provider_event_id, object_path, object_generation)` and drops duplicates, but correctness is unchanged if dedupe is disabled.
+3. **WAL events never commit manifests.** WAL events may wake prefetch workers, but only manifest enumeration can create a plan. A WAL event that arrives before its manifest simply prefetches bytes.
+4. **Queue backpressure falls back to polling.** If event backlog exceeds `queue_depth_poll_fallback` (default 1000), the coordinator drains or discards event payloads and switches to polling-only until the backlog recovers. This preserves correctness and bounds memory.
+5. **Stale stream alerts.** If no event arrives for `stale_event_timeout_secs` and polling is still healthy, emit an advisory alert. If polling also fails, emit a critical alert because the coordinator has lost both wake-up paths.
+
+This contract gives sub-second freshness when the event channel is healthy, but does not make correctness depend on any event provider's ordering or delivery guarantees.
+
 ## Sustained-Latency Mode
 
 For applications that need *consistently* low end-to-end lag — say, "the target is never more than 2 seconds behind the source" — the mirror runs in a mode that combines: event-driven manifest wake-up, WAL prefetch always on, workers permanently held warm (no spin-down), and an upper bound on snapshot batching so that large bursts of WAL files cannot starve manifest commits.
@@ -660,6 +788,8 @@ wal_prefetch         = true
 external_dbs_policy  = "inline"       # inline | preserve_remapped
 digest_algo          = "xxh3-128"     # xxh3-128 | blake3-256
 allow_non_empty_target = false
+coalesce_threshold_versions = 128      # when behind, skip intermediate manifests
+coalesce_threshold_bytes    = 1073741824 # or coalesce once backlog exceeds 1 GiB
 
 [worker]
 count                = 16
@@ -671,6 +801,17 @@ placement_hint       = "source_region"
 [target_gc]                          # Mirror-aware GC; off by default
 enabled = false
 retain_window_hours = 24
+retain_manifest_count = 1024
+find_orphans = false                  # expensive deep scan, opt-in
+
+[schema]
+manifest_max_version = 2              # source manifests above this fail closed
+tolerate_unknown_fields = false       # FlatBuffers: unknown manifest fields are not preserved by parsing
+
+[events]
+stale_event_timeout_secs = 300
+queue_depth_poll_fallback = 1000
+dedupe_window_secs = 300
 
 [observability]
 metrics_endpoint = "0.0.0.0:9090"
@@ -686,7 +827,14 @@ s3e-mirror plan     --config s3e-mirror.toml     # dry-run; emits planned bytes 
 s3e-mirror run      --config s3e-mirror.toml
 s3e-mirror status   --config s3e-mirror.toml     # shows lag, queue depth, last commit
 s3e-mirror verify   --config s3e-mirror.toml --level 1|2|3|4|5
+s3e-mirror verify-fences --config s3e-mirror.toml
+s3e-mirror verify-gc-fencing --config s3e-mirror.toml
+s3e-mirror repair   --config s3e-mirror.toml --priority newest|oldest|smallest
+s3e-mirror corruption-audit --config s3e-mirror.toml
+s3e-mirror gc       --config s3e-mirror.toml --dry-run [--include-orphans]
 s3e-mirror promote  --config s3e-mirror.toml     # safe cutover; see § Promotion
+s3e-mirror promotion-status --config s3e-mirror.toml
+s3e-mirror promotion-abort  --config s3e-mirror.toml
 s3e-mirror recover  --config s3e-mirror.toml     # idempotent restart helper
 ```
 
@@ -694,17 +842,17 @@ s3e-mirror recover  --config s3e-mirror.toml     # idempotent restart helper
 
 The mirror exposes Prometheus-style metrics:
 
-- `s3e-mirror_source_manifest_id` (gauge)
-- `s3e-mirror_target_manifest_id` (gauge)
-- `s3e-mirror_lag_seconds` (gauge; wall-clock between source manifest timestamp and target commit)
-- `s3e-mirror_lag_manifest_versions` (gauge)
-- `s3e-mirror_bytes_copied_total` (counter, labeled by `role`)
-- `s3e-mirror_objects_copied_total` (counter, labeled by `kind`)
-- `s3e-mirror_copy_errors_total` (counter, labeled by `phase`)
-- `s3e-mirror_worker_in_flight` (gauge per worker)
-- `s3e-mirror_queue_depth` (gauge)
-- `s3e-mirror_checkpoint_age_seconds` (gauge for source-side checkpoint)
-- `s3e-mirror_egress_bytes_total` (counter; equals the source cloud's bill line item)
+- `s3e_mirror_source_manifest_id` (gauge)
+- `s3e_mirror_target_manifest_id` (gauge)
+- `s3e_mirror_lag_seconds` (gauge; wall-clock between source manifest timestamp and target commit)
+- `s3e_mirror_lag_manifest_versions` (gauge)
+- `s3e_mirror_bytes_copied_total` (counter, labeled by `role`)
+- `s3e_mirror_objects_copied_total` (counter, labeled by `kind`)
+- `s3e_mirror_copy_errors_total` (counter, labeled by `phase`)
+- `s3e_mirror_worker_in_flight` (gauge per worker)
+- `s3e_mirror_queue_depth` (gauge)
+- `s3e_mirror_checkpoint_age_seconds` (gauge for source-side checkpoint)
+- `s3e_mirror_egress_bytes_total` (counter; equals the source cloud's bill line item)
 - `s3e_mirror_progress_vector_source_epoch{replica}` (gauge; current source epoch ID per replica)
 - `s3e_mirror_progress_vector_manifest_seen{replica,source_epoch}` (gauge)
 - `s3e_mirror_progress_vector_manifest_committed{target}` (gauge)
@@ -715,6 +863,21 @@ The mirror exposes Prometheus-style metrics:
 - `s3e_mirror_crdt_state_object_count{type}` (gauge; pre- and post-compaction)
 - `s3e_mirror_repair_backlog{target}` (gauge; pending repair observations)
 - `s3e_mirror_repair_bytes_total` (counter; bytes re-copied by repair workers)
+- `s3e_mirror_determinism_check_failures_total` (counter; immediate page)
+- `s3e_mirror_manifest_schema_version{version}` (gauge; current source/target manifest version)
+- `s3e_mirror_manifest_schema_mismatch_total` (counter; source version above mirror support)
+- `s3e_mirror_conditional_write_conflicts_total{provider,operation}` (counter; expected optimistic conflicts)
+- `s3e_mirror_conditional_write_transients_total{provider,status}` (counter; retryable provider throttles/conflicts)
+- `s3e_mirror_event_queue_depth` (gauge; event backlog)
+- `s3e_mirror_event_deduplicated_total` (counter; duplicate wake-up events ignored)
+- `s3e_mirror_event_stream_stale_seconds` (gauge; seconds since last event)
+- `s3e_mirror_source_checkpoint_ttl_seconds` (gauge)
+- `s3e_mirror_source_checkpoint_refreshes_total` (counter)
+- `s3e_mirror_source_gc_detected_missing_file_total` (counter; non-zero means operator action)
+- `s3e_mirror_wal_fence_files_copied_total` (counter)
+- `s3e_mirror_plans_created_total` (counter)
+- `s3e_mirror_manifests_coalesced_total` (counter; intermediate source manifests intentionally skipped)
+- `s3e_mirror_plan_churn_ratio` (gauge; plans created / source manifests observed)
 
 Logs are structured JSON, never include manifest payloads verbatim (the manifest may contain URIs with credentials in older V1 schemas), and are redacted by default.
 
@@ -722,23 +885,111 @@ Counters whose `_total` form is named above are reported as per-replica G-Counte
 
 ## Promotion and Cutover
 
-Promoting the target — turning the mirror copy into the active read-write database — is a deliberate operation:
+Promotion turns the mirror copy into the active read-write database. It is a state machine, not a loose checklist. The durable state lives under `mirror_state/promotion/{promotion_id}/` and every transition is written with `PutMode::Create`.
 
-1. **Quiesce the source writer.** If the source is reachable, stop the writer. If the source is unreachable, accept that you may lose any in-flight writes not yet observed by the mirror.
-2. **Drain the mirror.** Run `s3e-mirror status --wait-quiet` until the target manifest ID equals the source manifest ID (or until you decide to accept the lag).
-3. **Stop the coordinator.** `s3e-mirror stop --release-lease`. This deletes the lease and writes a `mirror_state/promoted.marker`.
-4. **Verify.** `s3e-mirror verify --level 3` runs a HEAD-per-file consistency check across the target's last committed manifest.
-5. **Open the target as a SlateDB writer.** Standard `Db::builder(target_root, target_store).build()`. The target is now the live database.
-6. **(Optional) Re-mirror in the opposite direction.** Treat the original source as the new mirror target. The system is symmetric.
+```rust
+enum PromotionState {
+    PrePromotion,
+    DrainInProgress,
+    DrainTimedOut,
+    VerificationInProgress,
+    VerificationFailed,
+    LeaseReleasing,
+    Promoted,
+    Aborted,
+}
+```
 
-The `promoted.marker` is checked on any subsequent `s3e-mirror run` invocation; a marker present means an operator must explicitly clear it to restart mirroring, preventing the catastrophic case of resurrecting a mirror against a now-promoted target.
+Allowed transitions:
+
+| From | Event | To | Notes |
+| --- | --- | --- | --- |
+| `PrePromotion` | `s3e-mirror promote` | `DrainInProgress` | writes `promotion_started` fact; refuses if another active promotion exists |
+| `DrainInProgress` | target catches source | `VerificationInProgress` | exact source/target manifest IDs recorded |
+| `DrainInProgress` | timeout | `DrainTimedOut` | operator chooses retry, abort, or `promote --force --accept-lag=N` |
+| `DrainTimedOut` | force accepted | `VerificationInProgress` | records accepted source lag and operator ID |
+| `VerificationInProgress` | level-3 verify passes + fences pass | `LeaseReleasing` | target still read-only |
+| `VerificationInProgress` | verify fails | `VerificationFailed` | no `promoted.marker`; mirror may repair and retry |
+| `VerificationFailed` | `promotion-abort` | `Aborted` | mirror resumes from previous lease state |
+| `VerificationFailed` | repair complete | `VerificationInProgress` | re-run verification from scratch |
+| `LeaseReleasing` | promoted marker created | `Promoted` | writes `mirror_state/promoted.marker` with promotion ID and target manifest digest |
+
+`mirror_state/promoted.marker` is the point of no return for this mirror epoch. Any later `s3e-mirror run` invocation refuses to start unless the operator explicitly runs `s3e-mirror reverse` or `s3e-mirror restart --new-epoch`. This prevents resurrecting a mirror against a target that may now have accepted writes.
+
+Promotion commands:
+
+```text
+s3e-mirror promote           --config s3e-mirror.toml [--wait] [--force --accept-lag=N]
+s3e-mirror promotion-status  --config s3e-mirror.toml
+s3e-mirror promotion-abort   --config s3e-mirror.toml
+s3e-mirror verify-fences     --config s3e-mirror.toml
+```
+
+Promotion checks before `Promoted`:
+
+1. Target latest manifest opens cleanly.
+2. Every referenced object exists and passes level-3 verification.
+3. Every zero-byte WAL fence in the live WAL interval exists on the target with size 0.
+4. `s3e-plan-digest`, `s3e-target-manifest-digest`, and `s3e-config-digest` metadata match recomputed values.
+5. No pending `RepairNeeded` facts affect the latest target manifest.
+6. No downstream mirror has declared `mirror_state/chain/predecessor_source` pointing at this target, unless operator passes `--acknowledge-chain-break`.
+
+If any check fails, promotion remains in `VerificationFailed`; the target stays read-only and the worker pool may continue repair.
+
+## Corruption Detection and Recovery Runbook
+
+Verification failures are actionable facts, not vague alarms.
+
+| Symptom | Likely cause | Automated action | Operator action |
+| --- | --- | --- | --- |
+| Level 1 missing object | worker never finished copy, target object deleted manually, or provider list/read inconsistency | write `Missing` repair fact | wait for repair; investigate if repeated |
+| Level 2 size mismatch | partial upload or wrong destination object | write `SizeMismatch` repair fact | revoke/inspect worker if repeated |
+| Level 3 digest mismatch | target corruption, source object changed unexpectedly, or digest bug | re-read both sides; write `DigestMismatch` repair fact | do not promote until latest manifest verifies clean |
+| Repair fact not draining | worker pool down, claim stuck, credentials broken | claim TTL expires and job re-enters pool | restart workers; check IAM |
+
+Promotion rule with known corruption:
+
+```text
+if corruption affects latest target manifest:
+    do not promote; repair and re-run verify --level 3
+else if corruption affects only older retained manifests:
+    verify latest target manifest explicitly;
+    if latest is clean, promotion may proceed with an audit warning
+else:
+    promotion may proceed
+```
+
+Repair commands:
+
+```text
+s3e-mirror verify --config s3e-mirror.toml --level 3 --scope manifest:<id>
+s3e-mirror repair --config s3e-mirror.toml --priority newest|oldest|smallest --max-files N
+s3e-mirror corruption-audit --config s3e-mirror.toml
+```
+
+`corruption-audit` reports oldest affected manifest, latest affected manifest, files awaiting repair, files successfully repaired, and estimated time to clean at current worker throughput.
+
+## Operational Runbooks
+
+These are the first actions an on-call operator should take. They are intentionally short; the CLI prints the same decision tree with current values filled in.
+
+| Incident | Trigger | First checks | Safe action |
+| --- | --- | --- | --- |
+| Mirror lag rising | `s3e_mirror_lag_seconds` above alert threshold | checkpoint age vs TTL, worker count, target throttling, source write rate | if checkpoint age > 80% TTL, increase `checkpoint_ttl_secs`; then add workers or enable coalescing |
+| Source rewind detected | candidate manifest ID/digest behind or divergent from last mirrored | confirm operator restore vs source bug | if expected, run `s3e-mirror restart --after-source-rewind --new-epoch`; if not, stop and inspect source |
+| Coordinator lease stuck | no manifest commits; lease expired or renewing late | promoted marker, current holder ID, process health | if no promoted marker, start standby coordinator; stale holder cannot commit with old fencing token |
+| Worker pool down | `s3e_mirror_worker_in_flight == 0` and `s3e_mirror_queue_depth > 0` | worker logs: auth, network, resource pressure | restart workers; claims expire automatically; do not touch manifests |
+| Dual mirror conflict | second mirror exits on lease create failure | which source/target pair is intended | revoke credentials for wrong mirror, verify survivor, keep target read-only until quiet |
+| Conditional-write storm | conflict/transient counters spike | same-bytes vs mismatch, provider status, recent deploy | same-bytes conflicts are benign; mismatch halts; transients trigger backoff and provider quota check |
+
+No runbook step asks an operator to edit manifests by hand. Manual object-store surgery is limited to revoking credentials, increasing TTLs, restarting processes, or deleting stale temp uploads after `verify --find-orphans` confirms they are unreachable.
 
 ## CRDT State Cold-Restart Performance
 
 Without mitigation, a replica starting from nothing reconstructs state by listing every object under `mirror_state/`. At scale (millions of tracked file-target pairs) that is tens of seconds at best and minutes at worst. Five complementary techniques keep it well under 10 seconds in practice:
 
 **1. Checkpoint-then-tail (primary mitigation).**
-Every 15 minutes (configurable; also triggered when `crdt_state_object_count` crosses a threshold), the coordinator writes a compacted checkpoint: one JSON document per CRDT type that represents the merged state up to that point. `CHECKPOINT_TIP` is updated atomically after a second replica verifies the checkpoint is correct. A cold-starting replica reads:
+Every 15 minutes (configurable; also triggered when `s3e_mirror_crdt_state_object_count` crosses a threshold), the coordinator writes a compacted checkpoint: one JSON document per CRDT type that represents the merged state up to that point. `CHECKPOINT_TIP` is updated atomically after a second replica verifies the checkpoint is correct. A cold-starting replica reads:
 
 ```
 1. GET mirror_state/CHECKPOINT_TIP           (~1 ms)
@@ -759,7 +1010,7 @@ A replica does not have to wait for the full state before it starts operating. W
 Every compaction run writes a new checkpoint and updates `CHECKPOINT_TIP` immediately. This means the pointer is always fresh (within one compaction cycle, not within one wall-clock hour). The tail that accumulates between checkpoints is proportional to compaction frequency, not to system uptime.
 
 **5. On-demand compaction when the tail grows.**
-If `crdt_state_object_count{type}` rises above a configurable high-water mark (default: 50k per type), the coordinator triggers an out-of-schedule compaction run. This is the safety valve: even if the regular schedule is missed (coordinator was down), the first healthy coordinator trims the tail before the next restart would be slow.
+If `s3e_mirror_crdt_state_object_count{type}` rises above a configurable high-water mark (default: 50k per type), the coordinator triggers an out-of-schedule compaction run. This is the safety valve: even if the regular schedule is missed (coordinator was down), the first healthy coordinator trims the tail before the next restart would be slow.
 
 **Expected cold-restart times with all five applied:**
 
@@ -777,13 +1028,34 @@ New metrics for observability:
 
 ## Mirror-Aware Target GC
 
-The target accumulates files; eventually we want to delete files that are no longer referenced by any committed target manifest and that have not been referenced for some configurable retention window. This is **off by default**. When enabled, the mirror-aware GC:
+The target accumulates files; eventually we want to delete files that are no longer referenced by any committed target manifest and that have not been referenced for some configurable retention window. This is **off by default**. When enabled, the mirror-aware GC has a narrow contract:
 
 - Reads only committed target manifests.
-- Computes the union of referenced files across the last N committed manifests (configurable window).
+- Computes the union of referenced files across both `retain_window_hours` and `retain_manifest_count`; an object is protected if either rule keeps it.
 - Honors the same mirror lease as the coordinator; refuses to run if no current lease exists.
-- Logs every candidate for deletion, with a dry-run mode.
-- Never deletes anything in `mirror_state/` other than archived plans older than the retention window.
+- Refuses to run while promotion is in progress.
+- Refuses to delete a file named by any pending plan, active claim, uncommitted copy-ledger entry, or repair observation.
+- Logs every candidate and every deletion as an immutable audit event, with dry-run mode on by default for the first run.
+- Never deletes `mirror_state/` except archived plans, ack summaries already reflected in checkpoints, expired claim attempts older than `lease_ttl * 100`, and stale compaction candidates whose checkpoint never became reachable from `CHECKPOINT_TIP`.
+
+Eligible data objects:
+
+```text
+eligible(file) =
+    not referenced by retained target manifests
+    AND not referenced by in-flight mirror state
+    AND object_mtime < now - retain_window_hours
+    AND object path is under wal/, compacted/, or provider-specific temp upload prefix
+```
+
+Orphan detection is separate because it requires scanning the target prefix, not just manifests:
+
+```text
+s3e-mirror verify --config s3e-mirror.toml --find-orphans
+s3e-mirror gc     --config s3e-mirror.toml --dry-run --include-orphans
+```
+
+For RockLake, the same rules apply to Parquet data files under the configured data prefix, except `excise` policy may intentionally retain data on the target when `preserve_excise = false`.
 
 ---
 
@@ -793,21 +1065,54 @@ The target accumulates files; eventually we want to delete files that are no lon
 
 All path-resolution, manifest-parsing, plan-diffing, and digest logic is deterministic and tested with property-based tests. We test that `plan_delta(M_n, M_{n+1})` is correct against synthesized manifests covering: WAL window expansion, WAL window contraction (compaction), L0 promotion, deep-level compaction, external_db addition, checkpoint addition/removal, V1↔V2 schema differences, and rewind detection.
 
+Additional mandatory unit/property tests:
+
+- `plan_bytes_are_order_independent`: randomized object-store listing order, worker order, hash-map insertion order, and event arrival order all produce identical `Plan` bytes.
+- `manifest_translation_is_golden`: every corpus source manifest translates to expected target manifest bytes, with `target_manifest_digest` unchanged across platforms.
+- `manifest_unknown_version_fails_closed`: source version above `manifest_max_version` fails before planning.
+- `hlc_only_in_crdt_layer`: plan and target manifest bytes are unchanged when HLC values differ.
+- `crdt_compaction_preserves_join`: `join(compact(S), Δ) == join(S, Δ)` for every CRDT type and randomized future delta.
+- `checkpoint_tip_update_is_monotonic`: any interleaving of two compactors leaves `CHECKPOINT_TIP` pointing to the newest verified checkpoint or to an older safe checkpoint that will be advanced on the next run; never to invalid bytes.
+- `coalescing_is_deterministic`: replicas with the same source/target/progress state make the same coalesce-vs-1:1 decision and produce the same `coalesced_source_range`.
+
 ## Integration Tests
 
 Against the `object_store` `InMemory` and local-disk backends, we run end-to-end mirroring scenarios: cold start, steady-state tail, worker crash, coordinator crash, lease takeover, source-rewind, target-GC-collision, and dual-mirror conflict. Each scenario asserts both correctness (target opens cleanly with expected keys/values) and invariants (no missing files, no orphan files).
+
+Integration tests also cover promotion state transitions: drain success, drain timeout with abort, verification failure with repair, concurrent promotion attempt, promoted-marker refusal on restart, and `verify-fences` rejecting a missing zero-byte WAL fence.
 
 ## Cross-Provider Tests
 
 A CI matrix runs the same scenarios against real S3, Azure Blob, GCS, and MinIO. These are gated on credentials and run nightly.
 
+The cross-provider matrix has a special conditional-write suite:
+
+- `PutMode::Create` conflict returns the expected `AlreadyExists`/`Precondition` class and never overwrites.
+- `PutMode::Update(UpdateVersion)` succeeds with the current version token and fails after a concurrent update.
+- Multipart conditional completion conflict is retried correctly; on S3, the failed multipart is aborted and restarted.
+- Existing-object same-bytes conflict is accepted only after byte and metadata comparison.
+- Existing-object different-bytes conflict halts with determinism violation.
+
 ## DST (Deterministic Simulation Testing)
 
 We integrate with SlateDB's own `slatedb-dst` harness: a seeded scheduler interleaves source writes, mirror worker steps, and injected faults (kill -9, network drop, clock jump, object-store throttle). Each seed must end in a state where the target opens to a manifest whose contents are a valid prefix of the source's history.
 
+DST must include at least these schedules before Phase 6/7 features are enabled:
+
+- two coordinators compute the same plan while source manifests continue to advance;
+- two coordinators compute different bytes for the same target manifest ID (synthetic fault) and both halt;
+- compactor writes checkpoint while a reader is mid-LIST and a worker writes new ack facts;
+- event stream drops every manifest event for 10 minutes while polling remains healthy;
+- source checkpoint TTL approaches expiry while workers are throttled;
+- source GC boundary advances between file listing and boundary validation;
+- promotion verify fails halfway through and then succeeds after repair;
+- HLC clocks jump backward and forward while CRDT facts continue to merge.
+
 ## Schema-Compatibility Tests
 
 For each SlateDB minor release, we run a compatibility suite: open a known-good source database, mirror it, and verify that opening the target with the same SlateDB version yields byte-identical query results. We also test against the previous and next SlateDB version to catch schema drift early.
+
+For a source version newer than the mirror supports, the expected result is fail-closed with `s3e_mirror_manifest_schema_mismatch_total` incremented. There is no fallback translation mode.
 
 ## Chaos Drills
 
@@ -963,14 +1268,14 @@ s3e-mirror-cli       `s3e-mirror` binary with subcommands
 
 These are the questions we do not yet have a confident answer to. Each one is a design conversation we expect to have with the SlateDB maintainers, with our own users, and with ourselves once we have some operational experience.
 
-1. **Manifest commit ordering vs source pace.** If a source publishes new manifests faster than the mirror can copy the underlying files, do we want to commit *every* intermediate target manifest (preserving the source's revision history) or *coalesce* into a smaller number of target manifests (reducing target write amplification at the cost of losing some intermediate states)? Default proposal: coalesce when behind by more than `coalesce_threshold` versions, otherwise mirror 1:1.
-2. **Snapshot retention on the target.** How many old target manifests do we keep? Forever is expensive; only the latest is fragile during readers' open windows. Default proposal: keep the last 24 hours of target manifests, plus any pinned by named checkpoints.
+1. **Manifest commit ordering vs source pace.** Default proposal is now explicit: mirror 1:1 while lag is below `coalesce_threshold_versions`; coalesce to the newest source manifest once lag exceeds the version or byte threshold. The remaining question is whether any users require *full historical 1:1 target history* even when badly behind.
+2. **Long-term snapshot archival beyond default target retention.** The default retention is last 24 hours or 1024 manifests, whichever protects more. The open question is whether to add an explicit archive tier for old target manifests before mirror-aware GC removes their unreferenced files.
 3. **Mirror-of-mirror.** Can a target serve as the source for *another* mirror? In principle yes — the target is a valid SlateDB database — but the chained replication slot semantics need more thought.
 4. **Promotion symmetry.** When the target is promoted, do we expect operators to reverse the mirror automatically (so the old source becomes the new mirror's target), or is that always a manual decision? Default proposal: manual, with `s3e-mirror reverse` as a documented convenience.
 5. **Tenancy.** Can one s3e-mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
 6. **Network egress observability.** Should we ship an opinionated "this is what your cloud bill will look like next month" estimator? It is genuinely useful and operators will ask, but it is also a maintenance burden as cloud pricing drifts. Default proposal: ship a coarse model with caveats, link to the provider's calculator for ground truth.
-7. **Schema upgrade path on SlateDB minor releases.** When SlateDB ships a manifest schema change, the mirror's vendored codec must be updated. We need a CI signal that catches this within hours, not weeks.
-8. **CRDT compaction cadence.** Default proposal: **every 15 minutes**, plus on-demand when `crdt_state_object_count` exceeds 50k per type. Target invariant: `s3e_mirror_crdt_tail_object_count` stays below 5k under normal operation, so cold-restart tail LIST completes in under 2 seconds. See [§ CRDT State Cold-Restart Performance](#crdt-state-cold-restart-performance) and [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
+7. **Schema-change notification from SlateDB upstream.** The mirror now fails closed on unknown manifest versions and carries a golden corpus. The open question is process: how do we get alerted within hours when SlateDB lands a manifest schema change so the corpus and vendored codec can be updated before users upgrade sources?
+8. **CRDT compaction cadence.** Default proposal: **every 15 minutes**, plus on-demand when `s3e_mirror_crdt_state_object_count` exceeds 50k per type. Target invariant: `s3e_mirror_crdt_tail_object_count` stays below 5k under normal operation, so cold-restart tail LIST completes in under 2 seconds. See [§ CRDT State Cold-Restart Performance](#crdt-state-cold-restart-performance) and [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
 9. **IAM scoping policy.** Should the default deployment ship IAM templates that scope worker credentials to `mirror_state/jobs/claims/` + `jobs/acks/` + target object paths only, leaving manifest commits to coordinator credentials? Strongly leaning yes; documented in the security appendix of [ideas/crdts.md](ideas/crdts.md).
 
 ---
