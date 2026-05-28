@@ -261,6 +261,9 @@ The mirror writes only to its own target root, and within that root it writes to
 | Promotion verification fails                   | `verify --level 3` reports missing/mismatch | target remains read-only mirror          | repair or abort promotion; `promoted.marker` is not written |
 | Event channel drops or reorders messages        | polling observes source tip independently  | freshness degrades only                  | fall back to polling; alert on stale event stream |
 | WAL fence missing at target during promotion   | `verify-fences` finds missing zero-byte WAL | promotion aborts                         | repair by copying fence; re-run promotion verify |
+| Job marked obsolete during in-flight copy       | worker reads obsolete marker before or during transfer | none on target (bytes never uploaded, or ignored if upload already completed) | worker writes `CopyAborted` ack; plan advances; obsolete temp chunks are cleaned up by orphan detection |
+| Temp-chunk compose fails after all parts uploaded | compose API error or coordinator crash between compose and HEAD verify | partial compose; temp chunk objects remain | next coordinator re-reads chunk acks; reissues compose; parts reused via `PutMode::Create` convergence |
+| Temp-chunk orphans after crash                  | `s3e-mirror verify --find-orphans` detects unreachable objects under `mirror_state/temp_chunks/` | wasted storage; no correctness issue | `s3e-mirror gc --include-orphans` deletes confirmed orphans after retention window |
 
 ---
 
@@ -330,6 +333,8 @@ File layout, with the CRDT type backing each subtree:
 - `mirror_state/jobs/claims/{plan_id}/{job_id}/{claim_id}.json` — **G-Set of claim attempts**; effective owner derived as `argmax by (fencing_token, hlc, worker_id)` filtered by TTL.
 - `mirror_state/jobs/acks/{plan_id}/{job_id}/{ack_id}.json` — **G-Set** of verified completions.
 - `mirror_state/jobs/failures/{plan_id}/{job_id}/{failure_id}.json` — **G-Set** of failure observations.
+- `mirror_state/jobs/obsolete/{plan_id}/{job_id}/{coordinator_id}.json` — **G-Set** of dead-copy cancellation markers; workers poll for these before starting byte transfer and abort immediately if present. See [§ Dead-Copy Elimination](#dead-copy-elimination).
+- `mirror_state/temp_chunks/{file_hash}/part_{N:04}` — staging area for distributed temp-chunk staging of large files; objects are deterministically named and assembled via a provider-native compose call. See [§ Distributed Temp-Chunk Staging](#distributed-temp-chunk-staging).
 - `mirror_state/copy_ledger/by_file/{file_hash_prefix}/{file_hash}/{target_id}/{event_id}.json` — **OR-Map** from `(file, target)` to copy-event sets.
 - `mirror_state/copy_ledger/checkpoints/{checkpoint_id}.json` — compaction summaries that satisfy `join(compact(S), Δ) = join(S, Δ)` for all future deltas Δ.
 - `mirror_state/progress/{replica_id}/{event_id}.json` — **version-vector** of progress facts keyed by `(source_epoch, target_id)`; merge is pointwise max within epoch, no merge across epochs.
@@ -527,6 +532,52 @@ Rules:
 
 WAL files are the fastest-changing part of the database and the freshest data. In WAL prefetch mode, workers also subscribe to the source `wal/` prefix (via event subscription or fast polling) and proactively copy newly-appearing WAL SSTs into the target before any manifest mentions them. This is purely an optimization: those files will not be referenced by a target manifest until the corresponding source manifest is mirrored, but having them already present means the manifest commit completes immediately.
 
+## Dead-Copy Elimination
+
+LSM-tree databases exhibit high WAL and L0 churn: a WAL SST can be flushed, referenced by a manifest, compacted into L0, and garbage-collected at the source all within seconds during a write burst. Workers that are mid-copy of such files waste bandwidth and incur unnecessary egress charges. **Dead-copy elimination** aborts in-flight jobs whose target files have left the live file set before any bytes need to travel.
+
+Protocol:
+
+1. Whenever the coordinator processes a new source manifest, it computes the **live file set** for that manifest (the union of live file sets across all open plans).
+2. For every job in `planned` or `claimed` state whose target file is **not present in any open plan's live set**, the coordinator writes an obsolete marker with `PutMode::Create`:
+   `mirror_state/jobs/obsolete/{plan_id}/{job_id}/{coordinator_id}.json`
+3. Workers poll for the obsolete marker before initiating or resuming a byte transfer. On discovering the marker, the worker writes a `CopyAborted` ack and exits the job without uploading any bytes.
+4. A worker that completes its copy *after* an obsolete marker was written writes both a `CopyVerified` ack and an `ObsoleteAfterCopy` ledger note. The coordinator accepts either as satisfying the plan's job-completion condition.
+5. Dead-copy cancellation is **never** applied to manifest files, WAL fence files, or any file that appears in the live set of any plan currently in `wait_all_jobs_acked`; only files that have fallen out of every open plan's live set are eligible.
+
+The protocol is safe: at worst a worker completes a copy that turns out to be unneeded, which is harmless because the two-phase rule prevents any manifest from referencing an obsolete file before the coordinator has confirmed all live files are present.
+
+Metrics: `s3e_mirror_dead_copies_cancelled_total`, `s3e_mirror_dead_copy_bytes_saved_total`.
+
+## Target Presence Filter
+
+During snapshot planning the coordinator must determine which files in the source snapshot already exist on the target. The naive approach issues a `HEAD` request per candidate file; at scale — a large RockLake warehouse with millions of Parquet SSTs — the resulting API request volume generates charges that rival raw storage costs.
+
+The coordinator maintains an in-memory **Cuckoo Filter** (preferred over Bloom because it supports deletion) representing the complete set of files successfully copied to the target, keyed by `(source_root_id, logical_path)` hashed to a 64-bit fingerprint.
+
+**Population.** On cold start the filter is built by reading the latest `copy_ledger` CRDT compaction checkpoint plus any tail events. No target-side listing is required. The filter is updated in real time as workers emit `CopyVerified` ack events, and individual entries are removed when mirror-aware target GC emits `CopyDeleted` ledger events.
+
+**Usage during planning:**
+
+```text
+for file in candidate_source_manifest.referenced_files():
+    if presence_filter.definitely_not_present(file):
+        plan.add_copy_job(file)          # no target API call needed
+    else:
+        # positive result — may be a false positive; confirm with HEAD
+        if not target.head_exists(file):
+            plan.add_copy_job(file)
+        # else: already present, skip
+```
+
+A **negative** result (probability 1.0) guarantees the file is absent; no API call is needed. A **positive** result (including false positives at the configured rate, default ~0.5%) requires a single `HEAD` call to confirm. For a steady-state incremental snapshot where nearly all files are already present, the number of target-side `HEAD` calls drops to approximately `false_positive_rate × total_files` — a **~99% reduction** in Class B API request charges compared to the naive approach.
+
+**Why Cuckoo over Bloom.** Bloom filters do not support deletion. After any mirror-aware GC run the Bloom filter must be fully rebuilt from the `copy_ledger` checkpoint, whereas a Cuckoo filter handles individual deletions incrementally. The filter capacity and false-positive rate are configurable; the filter is held entirely in coordinator memory and is never persisted as a separate object.
+
+Configuration: `planner.presence_filter_capacity`, `planner.presence_filter_fpp`.
+
+Metrics: `s3e_mirror_presence_filter_lookups_total`, `s3e_mirror_presence_filter_head_requests_avoided_total`, `s3e_mirror_presence_filter_false_positives_total`.
+
 ## Target Manifest Translation
 
 Translation is the moment where we transform a source manifest into a target manifest. The transformation rules are:
@@ -674,6 +725,35 @@ Single-worker multipart uploads use the `object_store` crate's `put_multipart` f
 
 Cross-worker multipart — where one worker initiates a multipart upload, multiple workers upload parts, and one worker completes it — is **not** in the v1 design because it is not portable through the `object_store` trait. A backend-specific variant for S3 (and only S3) is planned for Phase 6; it is gated behind a feature flag and is only useful for objects above some threshold (~5 GiB) where parallel part upload meaningfully shrinks tail latency.
 
+## Distributed Temp-Chunk Staging
+
+For large objects that benefit from parallel copying, the mirror uses **distributed temp-chunk staging** as a portable, fully stateless alternative that sidesteps upload-ID portability limits entirely.
+
+**How it works:**
+
+1. When a file exceeds `temp_chunk_threshold_bytes` (default 500 MiB), the coordinator shards the copy job into deterministic chunk jobs, one per `temp_chunk_part_bytes` (default 64 MiB). Part count and boundaries are deterministic for any given `(file_hash, file_size)`.
+2. Chunk jobs are enqueued independently: each is a first-class job in `mirror_state/jobs/planned/{plan_id}/chunk_{file_hash}_{part_number:04}.json`. Any worker in the pool can claim any chunk.
+3. Workers download their assigned byte range (`Range: bytes=start-end` on the source GET), compute a per-part content digest in flight, and upload the bytes to `mirror_state/temp_chunks/{file_hash}/part_{part_number:04}` on the target with `PutMode::Create`. Two workers racing on the same chunk converge safely via create-if-absent.
+4. Once all `part_count` chunks carry `CopyVerified` acks, any worker holding the lease issues a **provider-native compose** to assemble the final object at its deterministic destination path:
+   - **GCS:** `objects.compose` (max 32 sources per call; the mirror uses a two-level compose tree for files with more than 32 parts, with deterministically-named intermediate objects).
+   - **Azure Blob:** Commit Block List (`Put Block List`) from the uploaded block names.
+   - **S3:** `CreateMultipartUpload` + `UploadPartCopy` referencing the temp chunk objects, then `CompleteMultipartUpload`; no bytes retransferred over the network.
+5. The assembling worker issues a `HEAD` verification on the final assembled object. Only after this verification passes does the plan treat the file as complete — preserving the Two-Phase Rule identically to single-worker copies.
+6. Temp chunk objects are deleted as best-effort cleanup after compose. Any stragglers are caught by `s3e-mirror verify --find-orphans` and are listed in `mirror_state/audit/`.
+
+**Safety properties:**
+
+- All chunk objects are named deterministically; crashes at any point leave only inert temp objects that the next coordinator can either reuse (via `PutMode::Create` convergence) or ignore (orphan detection).
+- The assembled final object does not enter the target manifest until it passes post-copy `HEAD` verification, keeping the two-phase rule intact.
+- A coordinator crash after partial chunk completion: the next coordinator re-reads chunk acks from CRDT state, enqueues only the missing chunks, and resumes; already-uploaded chunks are reused at zero cost.
+- Dead-copy elimination applies to chunk jobs: if the parent file becomes obsolete while chunks are in flight, all outstanding chunk jobs receive obsolete markers and workers abort.
+
+**When it applies:** Only activated when `worker.temp_chunk_threshold_bytes` is set and the source object's `Content-Length` exceeds the threshold. For smaller objects the default single-worker streaming path is used. The feature is off by default in Phase 1–4 and enabled by default in Phase 6.
+
+Configuration: `worker.temp_chunk_threshold_bytes`, `worker.temp_chunk_part_bytes`.
+
+Metrics: `s3e_mirror_temp_chunk_parts_uploaded_total`, `s3e_mirror_temp_chunk_compose_seconds`, `s3e_mirror_temp_chunk_orphan_parts_total`.
+
 ## Verification
 
 The mirror verifies each copy at three levels:
@@ -791,12 +871,18 @@ allow_non_empty_target = false
 coalesce_threshold_versions = 128      # when behind, skip intermediate manifests
 coalesce_threshold_bytes    = 1073741824 # or coalesce once backlog exceeds 1 GiB
 
+[planner]
+presence_filter_capacity = 10_000_000  # fingerprint slots; ~80 MiB at this size
+presence_filter_fpp      = 0.005       # ~0.5% false positive rate; drives HEAD call volume
+
 [worker]
 count                = 16
 in_flight_per_worker = 8              # initial; adaptive
 multipart_threshold_bytes = 67108864
 multipart_part_bytes      = 16777216
 placement_hint       = "source_region"
+temp_chunk_threshold_bytes = 536870912  # 500 MiB; files larger than this use temp-chunk staging
+temp_chunk_part_bytes      = 67108864  # 64 MiB per chunk part
 
 [target_gc]                          # Mirror-aware GC; off by default
 enabled = false
@@ -878,6 +964,14 @@ The mirror exposes Prometheus-style metrics:
 - `s3e_mirror_plans_created_total` (counter)
 - `s3e_mirror_manifests_coalesced_total` (counter; intermediate source manifests intentionally skipped)
 - `s3e_mirror_plan_churn_ratio` (gauge; plans created / source manifests observed)
+- `s3e_mirror_dead_copies_cancelled_total` (counter; jobs aborted before byte transfer because file left the live set)
+- `s3e_mirror_dead_copy_bytes_saved_total` (counter; bytes not transferred due to dead-copy elimination)
+- `s3e_mirror_presence_filter_lookups_total` (counter; planning decisions that consulted the presence filter)
+- `s3e_mirror_presence_filter_head_requests_avoided_total` (counter; target HEAD calls eliminated by a definite-negative filter result)
+- `s3e_mirror_presence_filter_false_positives_total` (counter; filter returned positive but HEAD confirmed file was absent)
+- `s3e_mirror_temp_chunk_parts_uploaded_total` (counter; individual chunk parts successfully uploaded to temp staging area)
+- `s3e_mirror_temp_chunk_compose_seconds` (histogram; time to execute provider-native compose call)
+- `s3e_mirror_temp_chunk_orphan_parts_total` (counter; temp chunk objects found by orphan detection with no reachable parent job)
 
 Logs are structured JSON, never include manifest payloads verbatim (the manifest may contain URIs with credentials in older V1 schemas), and are redacted by default.
 
@@ -1243,7 +1337,7 @@ We ship in two tracks simultaneously:
 - **Phase 3 — Continuous tail.** Implement the coordinator's polling loop, plan diffing, and incremental commit. Source-rewind detection. Lease and fencing.
 - **Phase 4 — Cross-cloud.** Real S3 and Azure backends. WAL prefetch. Adaptive concurrency. Cost-model instrumentation.
 - **Phase 5 — Event-driven tail + operations.** EventBridge/Event Grid/Pub-Sub integration. Promotion CLI. Mirror-aware GC. Verification levels. **Copy ledger** (OR-Map by `(file, target)`) and **anti-entropy repair** (worker pool drains repair observations) — see [ideas/crdts.md](ideas/crdts.md).
-- **Phase 6 — Advanced.** Per-backend distributed multipart for S3. Provider-native fast paths fully wired. Pluggable digest algorithms. Snapshot-bundle ingest once SlateDB ships item 8. **Progress vectors** persisted as CRDT facts; **coordinator standby** that reconstructs state and dry-runs deterministic plans for fast failover.
+- **Phase 6 — Advanced.** Per-backend distributed multipart for S3. Provider-native fast paths fully wired. Pluggable digest algorithms. Snapshot-bundle ingest once SlateDB ships item 8. **Distributed temp-chunk staging** enabled by default (see [§ Distributed Temp-Chunk Staging](#distributed-temp-chunk-staging)); GCS two-level compose tree and S3 `UploadPartCopy`-based assembly. **Dead-copy elimination** on by default with configurable obsolescence window. **Target presence filter** (Cuckoo Filter) on by default; capacity auto-tuned from copy-ledger checkpoint size. **Progress vectors** persisted as CRDT facts; **coordinator standby** that reconstructs state and dry-runs deterministic plans for fast failover.
 - **Phase 7 — Multi-coordinator HA and multi-target fan-out.** Two or more coordinator replicas race to commit *identical* deterministic target manifest bytes; `PutMode::Create` picks the winner and same-bytes-on-conflict verification guarantees safety. One source checkpoint protects copies to multiple independent targets, each with its own target manifest commit and progress vector — enabled by the copy-ledger's `(file, target)` keying.
 - **Phase 8 — Research.** Active-active RockLake (out of scope for the one-way mirror; requires upstream RockLake changes — globally unique snapshot/operation IDs, schema conflict policy). Tracked separately.
 
