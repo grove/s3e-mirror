@@ -284,7 +284,7 @@ File layout, with the CRDT type backing each subtree:
 - `mirror_state/repairs/observations/{target_id}/{file_hash}/{event_id}.json` — **OR-Map** of repair observations from auditors; workers consume these as ordinary copy jobs.
 - `mirror_state/counters/{counter_id}/{replica_id}.json` — **G-Counter** / **PN-Counter** slots; global value is the sum across replicas.
 - `mirror_state/audit/{event_id}.json` — **G-Set** of operator and compaction audit events; never compacted within retention window.
-- `mirror_state/CHECKPOINT_TIP` — small mutable pointer naming the most recent compaction checkpoint, allowing replicas to load checkpoint-then-tail instead of listing every fact on cold restart. Staleness affects performance only, never correctness.
+- `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Replicas use it as a hint to load checkpoint-then-tail instead of listing all facts. Staleness is safe (pointer is read-only by workers; a lagging pointer means reading a longer tail, not wrong answers). Updated by the compactor immediately after a checkpoint is verified by a second replica.
 - `mirror_state/schemas/v{N}.json` — JSON-Schema documents per CRDT schema version; new fields are additive within a version, breaking changes bump `N`.
 - `mirror_state/lease/000…N.lease` — sequenced single-publisher lease (unchanged from earlier description).
 
@@ -656,6 +656,48 @@ Promoting the target — turning the mirror copy into the active read-write data
 
 The `promoted.marker` is checked on any subsequent `s3e-mirror run` invocation; a marker present means an operator must explicitly clear it to restart mirroring, preventing the catastrophic case of resurrecting a mirror against a now-promoted target.
 
+## CRDT State Cold-Restart Performance
+
+Without mitigation, a replica starting from nothing reconstructs state by listing every object under `mirror_state/`. At scale (millions of tracked file-target pairs) that is tens of seconds at best and minutes at worst. Five complementary techniques keep it well under 10 seconds in practice:
+
+**1. Checkpoint-then-tail (primary mitigation).**
+Every 15 minutes (configurable; also triggered when `crdt_state_object_count` crosses a threshold), the coordinator writes a compacted checkpoint: one JSON document per CRDT type that represents the merged state up to that point. `CHECKPOINT_TIP` is updated atomically after a second replica verifies the checkpoint is correct. A cold-starting replica reads:
+
+```
+1. GET mirror_state/CHECKPOINT_TIP           (~1 ms)
+2. GET mirror_state/.../checkpoints/{id}.json  (~10-50 ms per type; ~5 files)
+3. LIST mirror_state/.../  filtered to  hlc > checkpoint.hlc  (~1-2 s; small tail)
+4. GET the small tail of new events            (~100-500 ms)
+```
+
+With 15-minute checkpoints, the tail is bounded: a busy mirror produces at most a few thousand events per 15-minute window, regardless of how many total facts exist.
+
+**2. Parallel LIST across sharded prefixes.**
+Every subtree under `mirror_state/` is sharded on the first N hex digits of the fact's natural key (file hash, job ID, etc.). This serves two purposes: it distributes load across S3 partition boundaries (avoiding hot-key throttling), and it lets cold-restart LIST all shards concurrently. Step 3 above fans out across all shards simultaneously rather than scanning one prefix sequentially.
+
+**3. Streaming state reconstruction.**
+A replica does not have to wait for the full state before it starts operating. Workers can start claiming jobs as soon as the `claims` and `acks` subtrees are loaded. The coordinator can start planning once `plans` and `progress` are loaded. Reading `copy_ledger` (the largest subtree) overlaps with the coordinator's first planning pass. The cold-restart "pause" is only as long as the minimum state needed for the first operation.
+
+**4. Compaction-triggered checkpoint writes.**
+Every compaction run writes a new checkpoint and updates `CHECKPOINT_TIP` immediately. This means the pointer is always fresh (within one compaction cycle, not within one wall-clock hour). The tail that accumulates between checkpoints is proportional to compaction frequency, not to system uptime.
+
+**5. On-demand compaction when the tail grows.**
+If `crdt_state_object_count{type}` rises above a configurable high-water mark (default: 50k per type), the coordinator triggers an out-of-schedule compaction run. This is the safety valve: even if the regular schedule is missed (coordinator was down), the first healthy coordinator trims the tail before the next restart would be slow.
+
+**Expected cold-restart times with all five applied:**
+
+| Scale | Without mitigations | With mitigations |
+|---|---|---|
+| 100k file-target pairs | ~5s | ~1s |
+| 1M file-target pairs | ~60s | ~3s |
+| 10M file-target pairs | ~10 min | ~5-8s |
+
+New metrics for observability:
+- `s3e_mirror_cold_restart_seconds` (histogram; measured on startup, labeled by what triggered cold-start)
+- `s3e_mirror_crdt_tail_object_count{type}` (gauge; objects written since last checkpoint — the "tail size")
+- `s3e_mirror_checkpoint_tip_age_seconds` (gauge; time since `CHECKPOINT_TIP` was last updated)
+- `s3e_mirror_checkpoint_write_seconds` (histogram; time to compact and write a new checkpoint)
+
 ## Mirror-Aware Target GC
 
 The target accumulates files; eventually we want to delete files that are no longer referenced by any committed target manifest and that have not been referenced for some configurable retention window. This is **off by default**. When enabled, the mirror-aware GC:
@@ -851,7 +893,7 @@ These are the questions we do not yet have a confident answer to. Each one is a 
 5. **Tenancy.** Can one s3e-mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
 6. **Network egress observability.** Should we ship an opinionated "this is what your cloud bill will look like next month" estimator? It is genuinely useful and operators will ask, but it is also a maintenance burden as cloud pricing drifts. Default proposal: ship a coarse model with caveats, link to the provider's calculator for ground truth.
 7. **Schema upgrade path on SlateDB minor releases.** When SlateDB ships a manifest schema change, the mirror's vendored codec must be updated. We need a CI signal that catches this within hours, not weeks.
-8. **CRDT compaction cadence.** How aggressively should `mirror_state/` compaction run? Too rarely and cold-restart `LIST` time grows; too often and we burn write requests. Default proposal: hourly, with a `CHECKPOINT_TIP` pointer so replicas read one checkpoint plus a small tail. See [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
+8. **CRDT compaction cadence.** Default proposal: **every 15 minutes**, plus on-demand when `crdt_state_object_count` exceeds 50k per type. Target invariant: `s3e_mirror_crdt_tail_object_count` stays below 5k under normal operation, so cold-restart tail LIST completes in under 2 seconds. See [§ CRDT State Cold-Restart Performance](#crdt-state-cold-restart-performance) and [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
 9. **IAM scoping policy.** Should the default deployment ship IAM templates that scope worker credentials to `mirror_state/jobs/claims/` + `jobs/acks/` + target object paths only, leaving manifest commits to coordinator credentials? Strongly leaning yes; documented in the security appendix of [ideas/crdts.md](ideas/crdts.md).
 
 ---
