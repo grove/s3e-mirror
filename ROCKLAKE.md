@@ -303,6 +303,23 @@ In addition to all the SlateDB-mirror metrics from [DESIGN.md](DESIGN.md), the R
 - **Level 2 (medium):** Level 1 plus size match (HEAD response size = `DataFileRow.file_size_bytes`).
 - **Level 3 (deep, opt-in):** Level 2 plus full-file digest re-computation against a stored digest map. Expensive; intended for periodic audits.
 
+All three levels can emit **repair observations** as CRDT facts under `mirror_state/repairs/observations/{target_id}/{file_hash}/` (see [DESIGN.md § Anti-Entropy Repair](DESIGN.md#anti-entropy-repair) and [ideas/crdts.md](ideas/crdts.md)). RockLake mirror workers consume these as ordinary copy jobs, making self-healing of cosmic-ray byte flips, partial cross-region replication, and similar drift a built-in property of the mirror rather than a manual playbook.
+
+## CRDT Mirror Metadata
+
+RockLake's data plane is already immutable and fact-like: Parquet files are content-addressed and never rewritten, snapshots only grow, and excise events are append-only audit rows. This is the ideal shape for state-based CRDTs.
+
+The RockLake mirror reuses the s3e-mirror control plane wholesale (see [DESIGN.md § CRDT-Shaped Mirror State](DESIGN.md#crdt-shaped-mirror-state)) and adds three RockLake-specific document types under the same `mirror_state/` tree:
+
+- `mirror_state/copy_ledger/by_file/{file_hash_prefix}/{file_hash}/{target_id}/{event_id}.json` — **OR-Map** entries for *Parquet* data files and delete files, in addition to SlateDB SSTs. The same `CopyEvent` enum applies (`Observed`, `CopyStarted`, `CopyVerified`, `ReferencedByCommit`, `RepairNeeded`, `RepairVerified`). The `target_id` keying makes multi-target fan-out (one source warehouse → multiple target warehouses) a small extension.
+- `mirror_state/path_rewrites/{rule_hash}/{event_id}.json` — **G-Set** of path-rewrite observations: which absolute-path Parquet files were translated, under which rule, with what before/after values, and the resulting target path. Used for auditing and for incremental work skipping.
+- `mirror_state/excises/{source_excise_event_id}/{event_id}.json` — **2P-Set** entries (add = excise observed at source; remove = excise applied at target). Once excised at the source the file cannot be un-excised; the target's apply step is monotonic and idempotent. When `preserve_excise = false` the remove half is never written and target retention diverges intentionally.
+- `mirror_state/progress/` — progress facts carry both `max_manifest_committed` (SlateDB catalog manifest) and `max_rocklake_snapshot_committed` (RockLake snapshot ID), keyed by `(source_epoch, target_id)`. The two layers' progress advances together but is observable independently.
+
+All documents are immutable, written with `PutMode::Create`, carry `schema_version`, and are compacted with a proven join law on the schedule defined in [ideas/crdts.md § Part VII](ideas/crdts.md). Listing cost stays bounded via `mirror_state/CHECKPOINT_TIP`.
+
+The net effect: incremental snapshot mirroring becomes "diff source against the copy ledger, plan only the new files," the auditor can mark specific Parquet files for repair without touching the catalog, and multi-target fan-out reuses one source snapshot pin across N targets.
+
 ---
 
 # Part VI — Failure Modes
@@ -378,6 +395,16 @@ If replication slots become first-class (item 1), then `rocklake slot-status` sh
 
 The existing NDJSON export (`docs/operations/backup-restore.md`) is logical and full. A "delta export since snapshot N" would let a mirror do a logical bootstrap from a snapshot dump rather than a per-file byte copy, which is sometimes preferable for very large warehouses.
 
+## Forward-Looking (Active-Active)
+
+### 11. Globally unique snapshot and operation IDs (optional mode)
+
+RockLake's current `u64` snapshot counter is fine for single-writer warehouses but cannot be allocated independently by two sites. An *optional* warehouse-level mode that uses ULIDs (or `(site_id, local_counter)` tuples with HLC ordering) for new snapshot and operation IDs would keep the existing semantics for the common case and unlock future active-active mirroring without forcing a migration. The mirror's CRDT mirror metadata (see [§ Part V CRDT Mirror Metadata](#crdt-mirror-metadata)) and the active-active research track in [ideas/crdts.md § Part IV](ideas/crdts.md) both depend on this.
+
+### 12. Site-stamped catalog operation log
+
+A catalog API that exposes operations as an append-only stream of `{op_id, site_id, hlc, deps, kind}` records (rather than just current state) would let mirrors merge concurrent catalog operations via union and replay deterministically. This is the foundation under any future active-active RockLake. Until item 11 lands, this can be additive metadata on the existing snapshot-keyed catalog.
+
 ---
 
 # Part VIII — Roadmap and Open Questions
@@ -402,6 +429,7 @@ We propose shipping in the same phased style as s3e-mirror itself:
 4. **Mirror-of-mirror.** Can a target serve as the source for another mirror? In principle yes, but the snapshot-pin chain needs explicit reasoning. Defer to a later phase.
 5. **Cross-provider Parquet path schemes.** DuckDB / the ducklake extension reads `s3://`, `gs://`, `az://`, `file://`. Does the mirror promise that the target catalog's paths are openable by the client at the target? Yes — the path translation step ensures this. We need a test matrix.
 6. **Compliance retention conflicts.** What if the source compliance policy says "delete after 30 days" (drives `excise`) but the target compliance policy says "retain for 7 years"? The `preserve_excise = false` mode supports this, but the compliance officer should sign off. Documented operational warning.
+7. **Active-active is future work.** Two warehouses being writable at the same time and converging is the highest-value extension but is **out of scope for v1**. It requires (a) RockLake-level changes: globally unique snapshot/operation IDs (see [§ Part VII item 11](#11-globally-unique-snapshot-and-operation-ids-optional-mode)), site-stamped operation logs (item 12), and an explicit schema-conflict policy; and (b) mirror-level changes: per-site progress vectors, HLC ordering of catalog operations, and add-wins OR-Set semantics over data files. The CRDT mirror metadata in [§ Part V](#crdt-mirror-metadata) is designed to make this extension possible without changing v1 data structures — but the policy and semantics work belongs upstream in RockLake. See [ideas/crdts.md § Part IV](ideas/crdts.md) for the research roadmap and prior art (Riak DT, Automerge, Yjs, Bedrock, Cassandra LWW).
 
 ---
 

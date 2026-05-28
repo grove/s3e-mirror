@@ -169,6 +169,16 @@ struct MirrorLease {
 
 The lease deliberately does not depend on wall-clock skew for correctness: even if two coordinators believe they hold valid leases simultaneously, the create-if-absent on the manifest commit path will reject whichever one's fencing token does not match the highest committed lease.
 
+## CRDT-Shaped Control Plane (Posture)
+
+s3e-mirror uses **state-based CRDTs with delta-state optimization** for its *control plane*, not for SlateDB's database state. Plans, job acknowledgements, copy-ledger entries, repair observations, progress facts, and per-replica counters are append-only mergeable facts stored as immutable objects under `mirror_state/`. The target manifest sequence remains strictly linear and is committed with `PutMode::Create` plus an expected predecessor.
+
+CRDTs help many workers and coordinators agree on **what has happened**; they do not replace the two-phase rule, the lease, or the single-publisher-per-manifest-ID invariant. The lease arbitrates *publication*; CRDT facts are *observable* by any replica without holding the lease. HLCs (Hybrid Logical Clocks) are used for tiebreaking within a single CRDT element; ordering of database operations still comes from the manifest sequence, never from clocks.
+
+This posture preserves the two-phase rule and enables multi-coordinator HA, multi-target fan-out, and self-healing anti-entropy repair as incremental extensions. The full treatment, including compaction with a proven join law, schema versioning, IAM scoping, and active-active research, lives in [ideas/crdts.md](ideas/crdts.md).
+
+Explicit non-goals: CRDTs are **not** used to merge SlateDB manifests, bypass SlateDB's single-writer model, or make the target writable while mirroring is active. Active-active RockLake is a separate future design requiring RockLake-level changes (globally unique snapshot IDs, schema conflict policy). Wall-clock timestamps are never used for ordering — only HLCs for tiebreaks and the manifest sequence for true order.
+
 ## Source-Side Safety
 
 The mirror never writes to the source store. The strongest action it takes is calling `Admin::create_detached_checkpoint`, `Admin::refresh_checkpoint`, and `Admin::delete_checkpoint` to maintain a small retention pin. The source's own GC, compactor, and writer continue to operate exactly as they would without a mirror. The only operational signal we send the source is the checkpoint TTL we have chosen.
@@ -193,6 +203,11 @@ The mirror writes only to its own target root, and within that root it writes to
 | Cross-region partial failure mid-copy         | per-object verification fails              | retry with backoff                      | adaptive concurrency throttles |
 | Workers in wrong region (cost escalation)     | observability alerts on egress             | alarm; no correctness issue             | operator moves workers |
 | Manifest published referencing missing file   | **impossible by construction** (two-phase rule) | n/a                                | n/a |
+| Two coordinators race to commit same manifest bytes (future HA) | one wins `PutMode::Create`; other verifies bytes match | none on target | both verify and continue |
+| Two coordinators compute different bytes for same manifest ID | losing create fails; bytes mismatch on read | mirror halts; alarm | operator investigates determinism bug |
+| Forged ack from compromised worker            | coordinator HEAD-verifies pre-commit       | snapshot aborts                         | revoke worker creds; audit `mirror_state/audit/` |
+| CRDT control-plane schema-version skew        | document carries unknown `schema_version`  | document isolated; metrics rise         | upgrade replicas |
+| CRDT state listing too slow                   | `crdt_state_object_count` exceeds threshold | latency degrades                       | trigger compaction; refresh `mirror_state/CHECKPOINT_TIP` |
 
 ---
 
@@ -242,15 +257,38 @@ A small **coordinator** process sits in front of the source database and watches
 
 ## Coordinator
 
-The coordinator is the only process that ever writes a manifest to the target. It holds the lease, polls the source manifest (and optionally subscribes to source object-store events), decides when a new snapshot is worth materializing, computes a plan, enqueues jobs, watches acks, translates the manifest, and commits. It is intentionally single-process per target; horizontal scale comes from workers, not coordinators.
+The coordinator is the process that holds the lease and publishes the next target manifest. It polls the source manifest (and optionally subscribes to source object-store events), decides when a new snapshot is worth materializing, computes a deterministic plan, enqueues jobs as CRDT facts, watches acks, translates the manifest, and commits.
+
+**v1 invariant:** one active publisher per target root, gated by the lease; optional read-only standby coordinators may observe and validate but never write to `manifest/`. **Future invariant (roadmap):** multiple coordinator replicas may race to commit the *same* deterministic target manifest bytes; `PutMode::Create` arbitrates publication, and same-bytes-on-conflict verifies safety. A mismatch in computed bytes for the same manifest ID is a determinism violation and halts the mirror with an alarm. Horizontal *capacity* always comes from workers, not coordinators.
 
 ## Workers
 
-Workers are stateless, restartable, and horizontally scalable. They each maintain a small in-memory cache of source and target `ObjectStore` clients, claim jobs from the queue, stream bytes from source to target while computing a content digest in flight, write the result to a deterministic path, write an ack marker, and exit the loop. A crashed worker leaves at most a stale claim marker and, possibly, a partially-uploaded object — both of which are handled by deterministic naming and reclaim-after-TTL.
+Workers are stateless, restartable, and horizontally scalable. They each maintain a small in-memory cache of source and target `ObjectStore` clients, claim jobs from the CRDT-shaped state, stream bytes from source to target while computing a content digest in flight, write the result to a deterministic path, write an ack fact (and a `CopyVerified` ledger event), and exit the loop. A crashed worker leaves at most a stale claim attempt and, possibly, a partially-uploaded object — both of which are handled by deterministic naming, reclaim-after-TTL, and the OR-Set semantics of claim attempts.
 
-## Queue
+## CRDT-Shaped Mirror State
 
-The queue lives in the target object store under `mirror_state/`. There is no external coordination service. Plans are immutable documents at `mirror_state/plans/{plan_id}.json`. Jobs are individual entries at `mirror_state/jobs/pending/{plan_id}/{job_id}.json`. Claims are at `mirror_state/jobs/claimed/{plan_id}/{job_id}/{worker_id}.claim`. Acks are at `mirror_state/jobs/acked/{plan_id}/{job_id}.ack`. Everything is sequenced and create-if-absent.
+All mirror coordination lives in the target object store under `mirror_state/` as a collection of typed, versioned, mergeable documents. There is no external coordination service. Every file is immutable and written with `PutMode::Create`; current state is derived by listing and joining facts.
+
+File layout, with the CRDT type backing each subtree:
+
+- `mirror_state/epochs/{target_root_hash}/{epoch_id}.json` — **G-Set** of mirror epochs (one continuous history of `(source_root, target_root)`); epochs do not auto-merge across rewinds.
+- `mirror_state/plans/{source_epoch}/{candidate_manifest_id}/{plan_digest}.json` — **G-Set** of deterministic plans; two plans with the same `(source_epoch, candidate_manifest_id)` but different `plan_digest` is a determinism violation.
+- `mirror_state/jobs/planned/{plan_id}/{job_id}.json` — **G-Set** of planned jobs.
+- `mirror_state/jobs/claims/{plan_id}/{job_id}/{claim_id}.json` — **G-Set of claim attempts**; effective owner derived as `argmax by (fencing_token, hlc, worker_id)` filtered by TTL.
+- `mirror_state/jobs/acks/{plan_id}/{job_id}/{ack_id}.json` — **G-Set** of verified completions.
+- `mirror_state/jobs/failures/{plan_id}/{job_id}/{failure_id}.json` — **G-Set** of failure observations.
+- `mirror_state/copy_ledger/by_file/{file_hash_prefix}/{file_hash}/{target_id}/{event_id}.json` — **OR-Map** from `(file, target)` to copy-event sets.
+- `mirror_state/copy_ledger/checkpoints/{checkpoint_id}.json` — compaction summaries that satisfy `join(compact(S), Δ) = join(S, Δ)` for all future deltas Δ.
+- `mirror_state/progress/{replica_id}/{event_id}.json` — **version-vector** of progress facts keyed by `(source_epoch, target_id)`; merge is pointwise max within epoch, no merge across epochs.
+- `mirror_state/progress/checkpoints/{checkpoint_id}.json` — progress compaction summaries.
+- `mirror_state/repairs/observations/{target_id}/{file_hash}/{event_id}.json` — **OR-Map** of repair observations from auditors; workers consume these as ordinary copy jobs.
+- `mirror_state/counters/{counter_id}/{replica_id}.json` — **G-Counter** / **PN-Counter** slots; global value is the sum across replicas.
+- `mirror_state/audit/{event_id}.json` — **G-Set** of operator and compaction audit events; never compacted within retention window.
+- `mirror_state/CHECKPOINT_TIP` — small mutable pointer naming the most recent compaction checkpoint, allowing replicas to load checkpoint-then-tail instead of listing every fact on cold restart. Staleness affects performance only, never correctness.
+- `mirror_state/schemas/v{N}.json` — JSON-Schema documents per CRDT schema version; new fields are additive within a version, breaking changes bump `N`.
+- `mirror_state/lease/000…N.lease` — sequenced single-publisher lease (unchanged from earlier description).
+
+Legacy v1 paths (`jobs/pending/`, `jobs/claimed/`, `jobs/acked/`) are accepted by the reader during transition. See [ideas/crdts.md](ideas/crdts.md) for the formal merge laws, compaction proof obligation, and IAM scoping per subtree.
 
 ## Data Model
 
@@ -286,6 +324,73 @@ struct Plan {
 enum Digest {
     Xxh3_128([u8; 16]),
     Blake3_256([u8; 32]),
+}
+
+// --- CRDT-shaped control-plane records ---
+//
+// All carry `schema_version: u32` so old replicas can isolate documents at
+// unknown versions and keep operating. See ideas/crdts.md for full semantics.
+
+struct Hlc { physical_ms: u64, logical: u32, replica_id: String }
+
+struct SourceEpochId { source_root_id: String, epoch_id: Ulid }
+
+struct MirrorEpoch {
+    schema_version: u32,
+    epoch_id: Ulid,
+    source_root_id: String,
+    target_root_id: String,
+    started_at: Hlc,
+    source_initial_manifest: Option<u64>,
+    target_initial_manifest: Option<u64>,
+    predecessor_epoch: Option<Ulid>,
+    reason: EpochReason,
+}
+
+enum EpochReason {
+    InitialBootstrap,
+    NormalRestart,
+    SourceRewindAcknowledged,
+    TargetPromoted,
+    OperatorForced,
+}
+
+struct CopyLedgerKey { file_identity_hash: Digest, target_id: String }
+
+enum CopyEvent {
+    Observed         { hlc: Hlc, observer_id: String },
+    CopyStarted      { hlc: Hlc, worker_id: String, claim_id: Ulid },
+    CopyVerified     { hlc: Hlc, worker_id: String, digest: Digest, size: u64 },
+    ReferencedByCommit { hlc: Hlc, manifest_id: u64 },
+    RepairNeeded     { hlc: Hlc, reason: String },
+    RepairVerified   { hlc: Hlc, worker_id: String },
+}
+
+struct CopyLedgerEntry {
+    schema_version: u32,
+    key: CopyLedgerKey,
+    events: std::collections::BTreeSet<CopyEvent>,
+}
+
+struct ProgressVector {
+    schema_version: u32,
+    reporter_id: String,
+    source_epoch: SourceEpochId,
+    target_id: String,
+    max_manifest_seen: Option<u64>,
+    max_manifest_planned: Option<u64>,
+    max_manifest_committed: Option<u64>,
+    max_rocklake_snapshot_seen: Option<u64>,
+    max_rocklake_snapshot_committed: Option<u64>,
+    hlc: Hlc,
+}
+
+struct GCounterSlot {
+    schema_version: u32,
+    counter_id: String,
+    replica_id: String,
+    value: u64,
+    hlc: Hlc,
 }
 ```
 
@@ -385,6 +490,12 @@ The mirror verifies each copy at three levels:
 1. **In-flight digest**: while streaming, compute xxh3-128 (default) or blake3-256 (when configured); reject any copy whose computed digest does not equal the source's recomputed digest. *(For objects copied via provider-native server-side copy, we cannot see bytes; we rely on the provider's own integrity guarantees and optionally re-list-and-spot-check.)*
 2. **Post-copy HEAD**: after the put completes, HEAD the target object and verify size matches expected size from the source listing.
 3. **Optional periodic deep verify**: a background "auditor" job, off by default, occasionally re-reads a random subset of target SSTs and re-computes their digests against a stored expected-digest map at `mirror_state/digests/`.
+
+### Anti-Entropy Repair
+
+Verification levels 2 and 3 (and any future external auditor) emit **repair observations** as CRDT facts under `mirror_state/repairs/observations/{target_id}/{file_hash}/{event_id}.json`. Observations are typed: `Missing`, `SizeMismatch`, `DigestMismatch`, or `Present`. Workers consume any non-`Present` observation as an ordinary copy job, retry the affected file using the deterministic destination name, and append `CopyVerified` + `RepairVerified` events to the copy ledger on success.
+
+No special coordinator path is required; repair is just another worker workflow gated by the same lease, fencing, and two-phase rule as initial copy. The auditor writes facts; the worker pool drains them. This makes self-healing of cosmic-ray byte flips, cross-region replication oddities, and partial deletes a built-in property rather than a separate operations playbook.
 
 ---
 
@@ -517,8 +628,20 @@ The mirror exposes Prometheus-style metrics:
 - `s3e-mirror_queue_depth` (gauge)
 - `s3e-mirror_checkpoint_age_seconds` (gauge for source-side checkpoint)
 - `s3e-mirror_egress_bytes_total` (counter; equals the source cloud's bill line item)
+- `s3e_mirror_progress_vector_source_epoch{replica}` (gauge; current source epoch ID per replica)
+- `s3e_mirror_progress_vector_manifest_seen{replica,source_epoch}` (gauge)
+- `s3e_mirror_progress_vector_manifest_committed{target}` (gauge)
+- `s3e_mirror_progress_vector_rocklake_snapshot_committed{target}` (gauge)
+- `s3e_mirror_crdt_schema_skew_total{type}` (counter; documents at unknown schema versions)
+- `s3e_mirror_crdt_determinism_violation_total` (counter; should remain zero)
+- `s3e_mirror_crdt_compaction_seconds` (histogram, labeled `type`)
+- `s3e_mirror_crdt_state_object_count{type}` (gauge; pre- and post-compaction)
+- `s3e_mirror_repair_backlog{target}` (gauge; pending repair observations)
+- `s3e_mirror_repair_bytes_total` (counter; bytes re-copied by repair workers)
 
 Logs are structured JSON, never include manifest payloads verbatim (the manifest may contain URIs with credentials in older V1 schemas), and are redacted by default.
+
+Counters whose `_total` form is named above are reported as per-replica G-Counter slots under `mirror_state/counters/`; the metrics endpoint sums them. This avoids losing counts when workers come and go and removes the need for a central aggregator.
 
 ## Promotion and Cutover
 
@@ -695,8 +818,10 @@ We ship in two tracks simultaneously:
 - **Phase 2 — Cold start to local target.** Implement workers, queue, and the bulk-copy path against an `InMemory` and local-disk target. End-to-end tests pass: source database opens, target database opens with identical keys.
 - **Phase 3 — Continuous tail.** Implement the coordinator's polling loop, plan diffing, and incremental commit. Source-rewind detection. Lease and fencing.
 - **Phase 4 — Cross-cloud.** Real S3 and Azure backends. WAL prefetch. Adaptive concurrency. Cost-model instrumentation.
-- **Phase 5 — Event-driven tail + operations.** EventBridge/Event Grid/Pub-Sub integration. Promotion CLI. Mirror-aware GC. Verification levels.
-- **Phase 6 — Advanced.** Per-backend distributed multipart for S3. Provider-native fast paths fully wired. Pluggable digest algorithms. Snapshot-bundle ingest once SlateDB ships item 8.
+- **Phase 5 — Event-driven tail + operations.** EventBridge/Event Grid/Pub-Sub integration. Promotion CLI. Mirror-aware GC. Verification levels. **Copy ledger** (OR-Map by `(file, target)`) and **anti-entropy repair** (worker pool drains repair observations) — see [ideas/crdts.md](ideas/crdts.md).
+- **Phase 6 — Advanced.** Per-backend distributed multipart for S3. Provider-native fast paths fully wired. Pluggable digest algorithms. Snapshot-bundle ingest once SlateDB ships item 8. **Progress vectors** persisted as CRDT facts; **coordinator standby** that reconstructs state and dry-runs deterministic plans for fast failover.
+- **Phase 7 — Multi-coordinator HA and multi-target fan-out.** Two or more coordinator replicas race to commit *identical* deterministic target manifest bytes; `PutMode::Create` picks the winner and same-bytes-on-conflict verification guarantees safety. One source checkpoint protects copies to multiple independent targets, each with its own target manifest commit and progress vector — enabled by the copy-ledger's `(file, target)` keying.
+- **Phase 8 — Research.** Active-active RockLake (out of scope for the one-way mirror; requires upstream RockLake changes — globally unique snapshot/operation IDs, schema conflict policy). Tracked separately.
 
 ## Crate Layout
 
@@ -726,6 +851,8 @@ These are the questions we do not yet have a confident answer to. Each one is a 
 5. **Tenancy.** Can one s3e-mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
 6. **Network egress observability.** Should we ship an opinionated "this is what your cloud bill will look like next month" estimator? It is genuinely useful and operators will ask, but it is also a maintenance burden as cloud pricing drifts. Default proposal: ship a coarse model with caveats, link to the provider's calculator for ground truth.
 7. **Schema upgrade path on SlateDB minor releases.** When SlateDB ships a manifest schema change, the mirror's vendored codec must be updated. We need a CI signal that catches this within hours, not weeks.
+8. **CRDT compaction cadence.** How aggressively should `mirror_state/` compaction run? Too rarely and cold-restart `LIST` time grows; too often and we burn write requests. Default proposal: hourly, with a `CHECKPOINT_TIP` pointer so replicas read one checkpoint plus a small tail. See [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
+9. **IAM scoping policy.** Should the default deployment ship IAM templates that scope worker credentials to `mirror_state/jobs/claims/` + `jobs/acks/` + target object paths only, leaving manifest commits to coordinator credentials? Strongly leaning yes; documented in the security appendix of [ideas/crdts.md](ideas/crdts.md).
 
 ---
 
