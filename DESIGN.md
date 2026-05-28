@@ -208,6 +208,8 @@ The mirror writes only to its own target root, and within that root it writes to
 | Forged ack from compromised worker            | coordinator HEAD-verifies pre-commit       | snapshot aborts                         | revoke worker creds; audit `mirror_state/audit/` |
 | CRDT control-plane schema-version skew        | document carries unknown `schema_version`  | document isolated; metrics rise         | upgrade replicas |
 | CRDT state listing too slow                   | `crdt_state_object_count` exceeds threshold | latency degrades                       | trigger compaction; refresh `mirror_state/CHECKPOINT_TIP` |
+| Checkpoint pointer race (two compactors)       | If-Match ETag fails on CHECKPOINT_TIP      | losing compactor discards its checkpoint; no visible effect | retry from step 1; verify winning checkpoint is at least as recent |
+| Checkpoint pointer regresses to older snapshot | coordinator reads newer than pointer       | cold restart reads longer tail than necessary | compactor detects and corrects on next run; correctness unaffected |
 
 ---
 
@@ -284,7 +286,7 @@ File layout, with the CRDT type backing each subtree:
 - `mirror_state/repairs/observations/{target_id}/{file_hash}/{event_id}.json` — **OR-Map** of repair observations from auditors; workers consume these as ordinary copy jobs.
 - `mirror_state/counters/{counter_id}/{replica_id}.json` — **G-Counter** / **PN-Counter** slots; global value is the sum across replicas.
 - `mirror_state/audit/{event_id}.json` — **G-Set** of operator and compaction audit events; never compacted within retention window.
-- `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Replicas use it as a hint to load checkpoint-then-tail instead of listing all facts. Staleness is safe (pointer is read-only by workers; a lagging pointer means reading a longer tail, not wrong answers). Updated by the compactor immediately after a checkpoint is verified by a second replica.
+- `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Updated by the compactor with an **If-Match ETag conditional write** after the checkpoint is verified by a second replica, preventing two compactors from racing to an older pointer. Staleness is safe; a lagging pointer means reading a longer tail, not wrong answers.
 - `mirror_state/schemas/v{N}.json` — JSON-Schema documents per CRDT schema version; new fields are additive within a version, breaking changes bump `N`.
 - `mirror_state/lease/000…N.lease` — sequenced single-publisher lease (unchanged from earlier description).
 
@@ -476,6 +478,81 @@ When source and target are different (the interesting case for cross-cloud mirro
 ## Conditional Writes Everywhere
 
 All three major clouds now support create-if-absent at the object-store API level: S3 since November 2024 supports `If-None-Match: *`, Azure has supported it for years, and GCS has supported `ifGenerationMatch: 0` for years. The `object_store` crate exposes this as `PutMode::Create` portably. The design uses this primitive **everywhere a uniqueness invariant matters**: lease files, claim markers, ack markers, manifest commits, plan files, and individual SST writes that name files we believe are not yet there. We never use ETags to enforce mutual exclusion across backends; we use the upload semantics themselves.
+
+## Optimistic Locking Protocol
+
+Beyond `PutMode::Create`, three operations use **If-Match ETag** conditional writes to close races that create-if-absent alone cannot prevent.
+
+### 1. Checkpoint pointer updates (If-Match)
+
+`mirror_state/CHECKPOINT_TIP` is a mutable pointer updated after every compaction. Without a conditional write, two compactors could interleave:
+
+```
+compactor_1 writes checkpoint A → (no pointer update yet)
+compactor_2 writes checkpoint B → updates CHECKPOINT_TIP to B
+compactor_1 updates CHECKPOINT_TIP to A   ← older checkpoint wins; B is orphaned
+```
+
+The correct protocol:
+
+```rust
+// Step 1: read current pointer and its ETag
+let (old_tip, etag) = object_store
+    .get_opts("mirror_state/CHECKPOINT_TIP", GetOptions { if_match: None, .. })
+    .await?;
+
+// Step 2: write and verify compaction checkpoint (unchanged)
+write_and_verify_checkpoint(checkpoint_id).await?;
+
+// Step 3: update pointer — succeeds only if no one else updated it
+object_store
+    .put_opts(
+        "mirror_state/CHECKPOINT_TIP",
+        Bytes::from(checkpoint_id.to_string()),
+        PutOptions { mode: PutMode::Update(UpdateVersion { e_tag: Some(etag), .. }), .. },
+    )
+    .await
+    .map_err(|_| CheckpointRace)?;  // retry from step 1 on conflict
+```
+
+On conflict, the losing compactor re-reads the pointer, verifies the winning checkpoint is at least as recent as its own, and discards its candidate. A checkpoint can never regress because the compactor verifies the winning checkpoint's `hlc` before accepting defeat.
+
+### 2. Plan digest in manifest metadata (defensive)
+
+When the coordinator commits a target manifest, it embeds the plan digest used to produce it as object metadata:
+
+```rust
+object_store.put_opts(
+    manifest_path,
+    manifest_bytes.clone(),
+    PutOptions {
+        mode: PutMode::Create,
+        attributes: Attributes::from_iter([
+            (Attribute::Metadata("plan-digest".into()),
+             AttributeValue::from(plan_digest.to_hex())),
+        ]),
+        ..
+    },
+).await?;
+```
+
+On a coordinator takeover or same-bytes race, the incoming coordinator reads the existing manifest, recomputes its own plan digest, and compares:
+
+```rust
+if existing_metadata["plan-digest"] != computed_plan_digest {
+    halt!("determinism violation: plan digests differ for manifest {manifest_id}");
+}
+```
+
+This catches determinism bugs one write earlier than the current same-bytes-on-conflict check, and records forensic evidence (which plan produced which manifest) in a way that survives process restarts.
+
+### 3. Compaction checkpoint immutability
+
+Checkpoint files themselves (`mirror_state/.../checkpoints/{checkpoint_id}.json`) are written with `PutMode::Create` and never overwritten. A compaction bug that tries to write a different checkpoint under the same ID fails immediately. Old checkpoints are deleted only after `CHECKPOINT_TIP` has been atomically advanced to a newer one (step 3 above) and the deletion is logged in `mirror_state/audit/`.
+
+### What we deliberately do not use optimistic locking for
+
+CRDT facts (acks, copy-ledger events, repair observations, progress, counters) use **no locking at all**. Their merge operators are commutative and idempotent, so every write is safe regardless of order. Adding If-Match or version checks there would be counterproductive — it would turn a lock-free design into a contested write for no correctness benefit.
 
 ## Multipart and Streaming
 
