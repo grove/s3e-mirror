@@ -1,6 +1,6 @@
 # s3e-mirror — Cross-Store SlateDB Mirroring
 
-**Status:** Design / RFC, second hardening pass.
+**Status:** Design / RFC, second hardening pass + FinOps cost-optimization pass.
 **Audience:** This document is written to be read end-to-end by an engineer who will implement the system, but the opening sections, the section introductions, and the "in plain English" paragraphs are written so that a curious non-technical reader (a product manager, an SRE lead, an executive sponsor) can follow along, understand the trade-offs, and ask sharp questions.
 
 ---
@@ -160,7 +160,11 @@ The second hardening pass uncovered several more problems the first draft did no
 17. **Secret hygiene.** Manifest V1 historically embedded a WAL store URI that could include credentials. The mirror's logs and observability must never echo manifest bytes blindly.
 18. **Concurrent-reader compatibility.** Read-only readers opening the target while the mirror is committing can race the manifest list. SlateDB's reader is already designed around this, but the mirror must publish manifests in strictly monotonic order with no gaps, otherwise readers can skip forward over a manifest that referenced a file we have not yet copied. The new design's [§ Two-Phase Rule](#two-phase-rule) makes gaps impossible.
 
-These eighteen items are the design constraints. The rest of the document is how they are satisfied.
+19. **Control-plane request amplification.** The cost-dominant failure mode for short-lived or write-heavy databases is not egress but **API requests**, and the worst offender is the mirror's own control plane: a "one immutable object per fact" design turns every copied file into a fistful of Class A PUTs and every restart into a million-key LIST. Left naive, the bookkeeping can cost more than the bytes. The new design batches control-plane facts into segment objects, keeps counters in memory, and treats CRDT compaction as a request-and-storage cost control, not only a latency control. See [§ Control-Plane Request Cost](#control-plane-request-cost).
+
+20. **Storage class and the hidden network tax.** A DR copy is written once and read almost never, yet a naive mirror leaves the entire second copy in the standard/hot tier and routes bulk bytes through a metered NAT — overpaying multiples on both storage and transfer, often more than on egress itself. The new design tiers the cold compacted bulk into instant-retrieval cool/cold classes (never breaking read-openability, never tiering tiny or churny objects), drives transfers through free private endpoints and Internet-Gateway egress rather than metered NAT, and runs the crash-safe worker pool on spot/preemptible compute. See [§ Storage Class Strategy and Lifecycle](#storage-class-strategy-and-lifecycle), [§ Network Path Cost: Avoid the NAT Tax](#network-path-cost-avoid-the-nat-tax), and [§ Compute Cost: Spot Workers and Autoscaling](#compute-cost-spot-workers-and-autoscaling).
+
+These twenty items are the design constraints. The rest of the document is how they are satisfied.
 
 ---
 
@@ -264,6 +268,11 @@ The mirror writes only to its own target root, and within that root it writes to
 | Job marked obsolete during in-flight copy       | worker reads obsolete marker before or during transfer | none on target (bytes never uploaded, or ignored if upload already completed) | worker writes `CopyAborted` ack; plan advances; obsolete temp chunks are cleaned up by orphan detection |
 | Temp-chunk compose fails after all parts uploaded | compose API error or coordinator crash between compose and HEAD verify | partial compose; temp chunk objects remain | next coordinator re-reads chunk acks; reissues compose; parts reused via `PutMode::Create` convergence |
 | Temp-chunk orphans after crash                  | `s3e-mirror verify --find-orphans` detects unreachable objects under `mirror_state/temp_chunks/` | wasted storage; no correctness issue | `s3e-mirror gc --include-orphans` deletes confirmed orphans after retention window |
+| Worker routes bulk copy through metered NAT     | pre-flight route check (`s3e_mirror_worker_nat_suspected_total`); transfer cost ≫ egress baseline | transfer cost up to ~2×; **no correctness issue** | add gateway/private endpoint for reads; move workers to Internet-Gateway egress path |
+| Control-plane write storm (PUTs-per-file anomaly) | `s3e_mirror_control_plane_puts_total`/file above baseline; budget soft ceiling | request-cost spike; **no correctness issue** | trigger CRDT compaction; raise batch sizes; find the retry/dual-write source |
+| Cost hard ceiling crossed                       | `s3e_mirror_estimated_cost_usd` exceeds `[cost.budget]` hard limit | **new** snapshot planning paused; in-flight commits and target validity untouched | operator raises budget or removes the driver; resume is automatic |
+| Object tiered below min size or before settle window | lifecycle/config lint; storage-cost regression | storage cost rises instead of falling | fix `storage.min_tier_bytes` / `storage.tier_after_hours` gates |
+| Live working set tiered to async `archive`      | promotion/read stalls on rehydration; verify finds object not synchronously retrievable | freshness/availability of the copy degraded; **no data loss** | re-tier the live set to an instant-retrieval class; reserve `archive` for superseded sets only |
 
 ---
 
@@ -345,6 +354,8 @@ File layout, with the CRDT type backing each subtree:
 - `mirror_state/CHECKPOINT_TIP` — mutable pointer to the most recent compaction checkpoint. Updated by the compactor with `PutMode::Update(UpdateVersion { e_tag, version })` after the checkpoint is verified by a second replica, preventing two compactors from racing to an older pointer. Staleness is safe; a lagging pointer means reading a longer tail, not wrong answers.
 - `mirror_state/schemas/v{N}.json` — JSON-Schema documents per CRDT schema version; new fields are additive within a version, breaking changes bump `N`.
 - `mirror_state/lease/000…N.lease` — sequenced single-publisher lease (unchanged from earlier description).
+
+**Write-coalescing (cost).** On the high-volume subtrees (`acks`, `failures`, `copy_ledger`, `progress`, `counters`), facts are *not* written one-object-per-fact in steady state; they are accumulated in memory and flushed as immutable **segment** objects under `…/_seg/{replica_id}/{hlc}.json`, each carrying many facts. Because every CRDT here is a set (or set-derived) structure, grouping facts into segments does not change the merge result — set-union is associative and commutative regardless of batching — so this is a pure request-cost optimization with no effect on correctness. Latency-critical singletons (the lease, a job claim, a manifest commit) are still written as their own `PutMode::Create` object. Without this, a busy mirror's own bookkeeping can outcost the bytes it copies; the economics are quantified in [§ Control-Plane Request Cost](#control-plane-request-cost).
 
 Legacy v1 paths (`jobs/pending/`, `jobs/claimed/`, `jobs/acked/`) are accepted by the reader during transition. See [ideas/crdts.md](ideas/crdts.md) for the formal merge laws, compaction proof obligation, and IAM scoping per subtree.
 
@@ -760,7 +771,7 @@ The mirror verifies each copy at three levels:
 
 1. **In-flight digest**: while streaming, compute xxh3-128 (default) or blake3-256 (when configured); reject any copy whose computed digest does not equal the source's recomputed digest. *(For objects copied via provider-native server-side copy, we cannot see bytes; we rely on the provider's own integrity guarantees and optionally re-list-and-spot-check.)*
 2. **Post-copy HEAD**: after the put completes, HEAD the target object and verify size matches expected size from the source listing.
-3. **Optional periodic deep verify**: a background "auditor" job, off by default, occasionally re-reads a random subset of target SSTs and re-computes their digests against a stored expected-digest map at `mirror_state/digests/`.
+3. **Optional periodic deep verify**: a background "auditor" job, off by default, occasionally re-reads a random subset of target SSTs and re-computes their digests against a stored expected-digest map at `mirror_state/digests/`. This is the one verification path that reads object *bytes* (levels 1–2 use only HEAD/metadata, which is free on every tier), so when compacted SSTs are tiered to `cool`/`cold` it incurs per-GiB **retrieval fees**. The sample rate (`verify.deep_sample_rate`) is therefore a cost knob as much as a confidence knob: a low rolling sample keeps it negligible, while a full re-verify of a tiered set is an explicit, costed operation reported by the costed dry-run. Levels 1–2 remain free to run continuously regardless of storage class.
 
 ### Anti-Entropy Repair
 
@@ -776,6 +787,8 @@ No special coordinator path is required; repair is just another worker workflow 
 
 The performance of a mirror is bounded by three things: how fast the source produces new bytes, how fast the network between source and target can move those bytes, and how fast we can notice that there are new bytes. The first is a property of the workload, not the mirror. The second is a property of the network and the worker placement, and we have a lot to say about it below. The third — *how fast we notice* — is what dominates freshness for low-write-rate databases, and the default of polling once every few seconds is dramatically improvable with object-store event subscriptions.
 
+Cost is a fourth thing, and it is the one a FinOps review cares about most. The intuitive cost of a mirror is "the bytes we move," but in practice the bill has several line items that all matter and that trade against each other: **data transfer** (egress, the headline number), **API requests** (the per-operation charges that quietly dominate when files are small and numerous — including the mirror's own control-plane bookkeeping), **storage** (a full second copy of the database, kept for a retention window, in some storage class), **compute** (the worker and coordinator VMs), and **hidden network plumbing** (the NAT/inter-AZ charges that have nothing to do with the data and everything to do with where the workers sit). A design that is correct but naive about any one of these can cost several times what a cost-aware design costs for byte-identical behavior. The rest of this part treats all of them, in provider-neutral terms, so the mirror is equally cheap on AWS, Azure, and GCP — and so that cost, like correctness, is *visible and bounded* rather than discovered on the invoice.
+
 ## Throughput Model
 
 For the dominant cross-cloud case, throughput is bounded by per-worker stream bandwidth times worker count, capped by either the source's egress bandwidth or the target's ingress rate-limits, whichever is tighter. We expect:
@@ -786,13 +799,145 @@ For the dominant cross-cloud case, throughput is bounded by per-worker stream ba
 
 ## Cost Model
 
-The dominant cost of cross-cloud mirroring is **source-side egress**. Object reads from S3 to an EC2 instance in the same region are free; from S3 to anywhere else they are billed at roughly 5 cents per GiB (varies by destination). For mirrors between large clouds, this is the line item that matters. A 1 TB database is ~$50 to mirror once; an ongoing 100 GiB/day of WAL is ~$5/day on egress. Per-request costs are typically negligible for SST sizes but can dominate for short-lived databases with many tiny WAL files.
+The dominant cost of *cross-cloud* mirroring is **source-side egress**. Object reads from S3 to an EC2 instance in the same region are free; from S3 to anywhere else they are billed at roughly 5–12 cents per GiB (varies by provider, destination, and committed-use discounts). For mirrors between large clouds this is the headline line item: a 1 TB database is ~$50 to mirror once, and an ongoing 100 GiB/day of WAL is ~$5/day on egress.
+
+But egress is only one of several line items, and it is *not* the one that surprises teams. The full taxonomy a FinOps review must price:
+
+| Line item | What drives it | Where it bites | Primary lever |
+| --- | --- | --- | --- |
+| **Data transfer (egress)** | bytes that cross a region or cloud boundary | always present cross-cloud; the headline number | copy each byte exactly once; worker placement; dead-copy elimination; coalescing |
+| **API requests** | every PUT/COPY/LIST (Class A, ~$0.005/1k) and GET/HEAD (Class B, ~$0.0004/1k) | short-lived DBs with many tiny WAL files; the mirror's *own control plane* | batch control-plane facts; presence filter; tip-pointer over LIST; `CopyObject` over stream when colocated |
+| **Storage** | a full second copy × retention window × storage class | large warehouses; long retention; everything left in the hot tier | storage-class tiering of the cold bulk; cost-aware retention; lifecycle cleanup |
+| **Compute** | worker + coordinator VM-hours; CPU for digesting | always-warm pools; on-demand pricing; over-provisioned worker count | spot/preemptible workers; autoscale-to-zero; ARM instances; xxh3 over blake3 |
+| **Hidden network plumbing** | metered NAT/SNAT data-processing, inter-AZ transfer, PrivateLink | mis-placed workers routing bulk bytes through a billed NAT | gateway/private endpoints; Internet-Gateway egress path; same-AZ workers |
+
+Three of these — **API requests, storage class, and the NAT tax** — are absent from most first-draft mirror designs and are each independently capable of *doubling* the bill for byte-identical behavior. The sections below address them in order of how often they are missed. Per-request costs in particular are "typically negligible for SST sizes but can dominate for short-lived databases with many tiny WAL files" — and the same warning applies, doubly, to the mirror's own per-fact bookkeeping.
+
+Two properties of SlateDB keep the mirror from ever paying twice. Every file is **content-addressed and immutable**, so a file is copied at most once in the database's lifetime — the presence filter ([§ Target Presence Filter](#target-presence-filter)) and copy ledger enforce this. And the **two-phase rule** means we never copy speculatively into a committed state; combined with dead-copy elimination ([§ Dead-Copy Elimination](#dead-copy-elimination)), bytes that die before they are referenced are never moved at all. Everything below is expressed in **provider-neutral** terms so the mirror is equally cheap on AWS, Azure, and GCP.
+
+## Storage Class Strategy and Lifecycle
+
+A DR mirror is the textbook workload for cold object-storage tiers: it is **written once, read almost never, and read in bulk only at the rare moment of promotion or deep verification**. Keeping the entire target copy in the standard/hot tier — as a naive mirror does — overpays for storage by 4–6× on the bulk of the data, which for a multi-terabyte warehouse is often a larger monthly number than the egress to seed it was. But tiering naively breaks two things: the mirror's "read-openable at any instant" invariant, and the per-object economics of small files. The strategy below captures the savings without breaking either.
+
+### Provider-neutral tiers
+
+The mirror exposes a single portable `storage_class` abstraction and maps it to each provider, so every optimization here works the same everywhere:
+
+| Portable tier | Retrieval latency | S3 | Azure Blob | GCS | Storage price vs hot | Caveats |
+| --- | --- | --- | --- | --- | --- | --- |
+| `hot` | instant | Standard | Hot | Standard | 1× (~$0.02/GiB-mo) | no minimum duration |
+| `cool` | instant | Standard-IA | Cool | Nearline | ~0.5× | 30-day min duration; 128 KiB min billable object |
+| `cold` | instant | Glacier Instant Retrieval | Cold | Coldline | ~0.18× | 90-day min duration; per-GiB retrieval fee |
+| `archive` | **asynchronous (minutes–hours)** | Glacier Flexible / Deep Archive | Archive | Archive | ~0.04× | 90–365-day min; rehydration latency + fee; **not openable without rehydration** |
+
+The correctness constraint that ties cost back to the design's core invariant: **every object referenced by a retained, openable target manifest must live in an instantly-retrievable tier (`hot`, `cool`, or `cold`) — never `archive`.** An asynchronous archive tier would make the target *not openable* until rehydration, violating "read-openable at any instant." `archive` is therefore permitted **only** for objects retained for point-in-time history that no longer appear in any manifest the operator expects to open synchronously; restoring from those is, by definition, the slow path.
+
+### Tiering rules
+
+The mirror tiers an object down only when **all three** independent gates pass:
+
+1. **Kind gate.** Only `compacted/` SSTs are candidates for `cool`/`cold`. WAL SSTs, zero-byte fences, manifests, and every `mirror_state/` control-plane object stay `hot` — they are short-lived, tiny, or hot-path, and tiering them backfires.
+2. **Size gate.** Only objects larger than `min_tier_bytes` (default 128 KiB, the S3-IA minimum billable size) are tiered. Below that, the per-object minimum billing of `cool`/`cold` *increases* cost. This single rule prevents the classic "we moved a million 4 KiB files to IA and the bill went up" mistake.
+3. **Age/settle gate.** An object is tiered only after `tier_after_hours` (default 24 h, ≥ the compaction settle window). This avoids early-deletion penalties: a compacted SST re-compacted and GC'd inside the 30–90-day min-duration window must never have been moved to a tier that bills that minimum.
+
+### Live vs superseded working set
+
+- **Live working set** (files referenced by the latest committed target manifest): `hot` for the most-recent layers, `cool`/`cold` for the older, large, rarely-touched compacted runs. All instant-retrieval, so promotion and reads never stall.
+- **Superseded retained set** (files inside the retention window but no longer in the latest manifest): eligible for `cold`, or `archive` if the operator accepts rehydration latency for old point-in-time restores.
+
+### How tiering is applied portably
+
+- **Write-time class.** Workers set the initial storage class on PUT for objects whose kind+size already qualify (`object_store` carries this through provider attributes), so a large compacted SST can land directly in `cool` and skip standard-tier storage entirely.
+- **Lifecycle rules.** The mirror declares provider-native lifecycle/management policies (S3 Lifecycle, Azure Blob lifecycle management, GCS Object Lifecycle Management) keyed on prefix (`compacted/`), object age, and minimum size, so transitions happen server-side at **zero request cost** and survive mirror downtime. The mirror never issues per-object COPY/transition calls itself — that would incur Class A charges; it declares the policy once and lets the provider enforce it.
+
+Provider auto-tiering (S3 Intelligent-Tiering, GCS Autoclass; Azure has no exact object-granular equivalent) is offered as an opt-in for `compacted/` only and is **not** the default: its per-object monitoring fee is a net loss on the many small objects a SlateDB layout contains, and its behavior differs enough across clouds to undermine the "equally well everywhere" goal.
+
+The read-cost caveat — deep verification and promotion reads from cold tiers incur retrieval fees — is priced in [§ Cost Observability and Guardrails](#cost-observability-and-guardrails) and surfaced as an open trade-off in [Part XIII](#part-xiii--open-questions). HEAD/metadata operations (the two-phase verification and presence filter) are *not* charged retrieval on any tier, so they stay cheap regardless of class.
+
+Metrics: `s3e_mirror_bytes_by_storage_class{class}`, `s3e_mirror_objects_by_storage_class{class}`, `s3e_mirror_lifecycle_transitions_total{from,to}`, `s3e_mirror_cold_tier_retrieval_bytes_total`.
+
+## Control-Plane Request Cost
+
+The CRDT-shaped control plane ([§ CRDT-Shaped Mirror State](#crdt-shaped-mirror-state)) is the mirror's most easily-overlooked cost. In its naive "one immutable object per fact" form, every copied file can generate a handful of Class A PUTs — a claim, an ack, one or more copy-ledger events, a progress update, a counter slot — plus the LIST traffic to read them all back on every cold restart and compaction. At ~$0.005 per 1,000 PUTs this is invisible at thousands of files and *dominant* at the hundreds of millions of tiny-object operations a busy WAL stream produces over a month. It is precisely the "many tiny WAL files" case the Cost Model warns about, turned inward on the mirror's own bookkeeping.
+
+Three rules control it, all of which preserve the CRDT join semantics — a batch is itself just an immutable set of facts, and set-union is unchanged by how facts are grouped:
+
+1. **Batched segment writes.** Workers and coordinators accumulate facts in memory and flush them as **segment objects** — `mirror_state/<subtree>/_seg/{replica_id}/{hlc}.json` carrying many facts — rather than one object per fact. A segment flushes when it reaches `control_plane.batch_max_facts` (default 256) or `control_plane.batch_max_ms` (default 1000 ms), whichever comes first. This collapses per-fact PUTs by up to two orders of magnitude while keeping the freshest fact at most ~1 s from durability. Per-fact objects remain *legal* and are still used for latency-critical singletons (lease, claim, manifest commit), so correctness is unchanged; batching is a pure write-coalescing optimization on the high-volume subtrees (acks, failures, copy-ledger, progress, counters).
+2. **Counters never write per increment.** G-/PN-Counter slots are kept in replica memory and flushed to `mirror_state/counters/{counter_id}/{replica_id}.json` via `PutMode::Update` on a timer (`control_plane.counter_flush_ms`, default 10 s) — not once per event. The Prometheus endpoint is the real-time counter surface; the object-store slot is only its durable, restart-survivable checkpoint.
+3. **Compaction is a cost control, not just a latency control.** The checkpoint-then-tail machinery ([§ CRDT State Cold-Restart Performance](#crdt-state-cold-restart-performance)) already trims the tail for fast restart; it is equally the mechanism that lets mirror-aware GC **delete** raw segments once they are folded into a verified checkpoint, bounding both storage and the LIST cost of every future restart.
+
+The presence filter and dead-copy elimination are the other two request-cost levers already in the design: the filter removes ~99% of planning-time HEADs, and dead-copy elimination removes both the egress and the PUT of files that die before they are referenced.
+
+Configuration: `control_plane.batch_max_facts`, `control_plane.batch_max_ms`, `control_plane.counter_flush_ms`.
+Metrics: `s3e_mirror_control_plane_puts_total{subtree}`, `s3e_mirror_control_plane_facts_per_segment` (histogram), `s3e_mirror_control_plane_list_requests_total`.
+
+## Network Path Cost: Avoid the NAT Tax
+
+The single most expensive *mistake* a mirror operator can make is routing bulk copy traffic through a metered NAT. On AWS a NAT Gateway bills **~$0.045 per GiB processed, on top of egress** — so a worker in a private subnet that GETs from the source and PUTs cross-cloud pays the NAT charge on every byte in *and* out, which can add 50–100% to the transfer line item for zero benefit. Azure (NAT Gateway / load-balancer SNAT) and GCP (Cloud NAT) have the same trap with similar per-GiB processing fees. By contrast an Internet Gateway has **no** per-GiB data-processing charge — you pay only the egress you would pay anyway.
+
+Rules, provider-neutral in intent:
+
+1. **Same-cloud reads go through a free private endpoint, never a NAT.** Use an S3 **Gateway VPC Endpoint** (free), GCS **Private Google Access**, or an Azure **Service/Private Endpoint** so the worker→source-store GET never touches metered NAT data processing.
+2. **Cross-cloud writes egress through an Internet Gateway, not a NAT Gateway.** Place workers where their cross-cloud PUT path is IGW-direct (public subnet or equivalent) rather than NAT'd.
+3. **Pin workers (and any in-region buffering) to a single AZ/zone matched to the source store's zone affinity** to avoid inter-AZ transfer charges on the in-region leg.
+
+This composes with [§ Placement and Cost](#placement-and-cost): workers belong in the source region (free/cheap pull), and within that region they must be wired so neither the pull nor the push is taxed by NAT. The mistake is caught in **pre-flight**, not on the monthly bill: a startup route-table check flags when store traffic would traverse a metered NAT.
+
+Metric: `s3e_mirror_worker_nat_suspected_total` (pre-flight/health check); `s3e_mirror_egress_bytes_total` already equals the source cloud's transfer line item.
+
+## Compute Cost: Spot Workers and Autoscaling
+
+Workers are, by [§ Workers](#workers), stateless, idempotent, and crash-safe: a killed worker leaves at most a stale claim (reclaimed after TTL) and a partially-uploaded object (overwritten on retry via deterministic naming). That is *exactly* the contract spot/preemptible instances require, so the worker pool runs on them by default:
+
+- **Spot / preemptible / low-priority VMs** (AWS Spot, GCP Spot/Preemptible, Azure Spot) cut worker compute 60–90%. A spot reclaim is indistinguishable from any other worker crash the design already tolerates — no new failure mode, no new code.
+- **ARM/Graviton-class instances** are cheaper per unit of the stream-and-digest work workers do; xxh3-128 (the default digest) is chosen partly because it saturates far less CPU than blake3, lowering the instance size needed per unit of throughput.
+- **Autoscale on backlog; scale to zero when idle.** Worker count tracks `s3e_mirror_queue_depth` / backlog bytes; in `snapshot` mode and between WAL bursts the pool scales to zero so an idle mirror costs only its (tiny) coordinator. Only `sustained-latency` mode holds a minimal warm pool — and that is now an explicit, priced choice rather than an accident.
+
+The **coordinator** holds the lease and commits manifests, so it wants stability — but lease takeover ([§ The Lease Model](#the-lease-model)) makes even a coordinator eviction safe. Run a single small on-demand coordinator and, if fast failover matters, a cheap cold standby that reconstructs state on takeover rather than an always-warm hot spare.
+
+Configuration: `worker.capacity_type`, `worker.min_count`, `worker.max_count`, `worker.scale_to_zero`, `worker.arch_hint`.
+Metrics: `s3e_mirror_worker_count{capacity_type}`, `s3e_mirror_worker_spot_reclaims_total`, `s3e_mirror_worker_idle_seconds_total`.
+
+## Lifecycle Automation and Temp-Object Cleanup
+
+Three classes of object accumulate cost if left to manual cleanup; each gets a provider-native lifecycle rule so cleanup is automatic, server-side, and free of per-object Class A charges — with the mirror's own orphan scan kept as a correctness backstop, not the primary mechanism:
+
+1. **Incomplete multipart uploads.** A failed `put_multipart` (or temp-chunk compose) leaves uploaded parts that *continue to bill as storage* indefinitely on S3 until aborted. The mirror declares an `AbortIncompleteMultipartUpload` lifecycle rule (S3) and its Azure/GCS equivalents so abandoned parts are reclaimed after `lifecycle.incomplete_mpu_abort_hours` (default 24 h). This is cheaper and more reliable than discovering them via `verify --find-orphans` and issuing DELETEs.
+2. **Temp-chunk staging objects.** After a successful compose, chunks under `mirror_state/temp_chunks/` are deleted best-effort; a lifecycle rule on that prefix (`lifecycle.temp_chunk_ttl_hours`, default 48 h) sweeps stragglers. Note the transient **2× storage** of a large file while its chunks and the composed object coexist — bounded by prompt deletion and this TTL.
+3. **Superseded `mirror_state/` segments and out-of-retention data.** Folded-in CRDT segments and out-of-retention compacted/WAL files are removed by mirror-aware GC, but a coarse lifecycle rule keyed on prefix and age is an always-on backstop so storage cannot grow unbounded even if GC is disabled.
+
+`verify --find-orphans` + `gc --include-orphans` remain available for cases lifecycle rules cannot express (objects unreachable for reasons other than age), but they are the audit path, not the routine cost-control path.
+
+Configuration: `lifecycle.incomplete_mpu_abort_hours`, `lifecycle.temp_chunk_ttl_hours`, `lifecycle.enable_provider_rules`.
+
+## Target Retention Cost
+
+Retention is a direct multiplier on storage: every retained-but-superseded manifest can pin a working set the latest manifest no longer needs. The default in [§ Mirror-Aware Target GC](#mirror-aware-target-gc) — "the union of `retain_window_hours` *and* `retain_manifest_count`, whichever protects **more**" — is the safety-maximizing choice and therefore the **cost-maximizing** one; an operator who never revisits it can pay for 1024 historical working sets they will never read.
+
+FinOps guidance, without weakening the safety floor:
+
+- The purpose of a DR mirror is the **latest** recoverable state; deep historical revisions are a separate, opt-in concern. `retain_manifest_count` is kept generous by default for safety, but it is now documented plainly as the **dominant storage knob**, to be sized to the operator's actual point-in-time-recovery requirement, not left at the maximum by inertia.
+- **Tier the retained tail.** Superseded-but-retained working sets are the prime `cold`/`archive` candidates: keep the latest manifest's set instantly available, let history age into cheap tiers.
+- `s3e-mirror plan` and `status` report **storage attributable to retention beyond the latest manifest**, so the price of the setting is visible before the bill arrives.
+
+Metrics: `s3e_mirror_retained_superseded_bytes` (bytes kept alive solely by retention, not by the latest manifest), `s3e_mirror_retained_manifest_count`.
 
 ## Placement and Cost
 
 The cheapest placement is to **run workers in the source region**. Source-region workers pull data over free intra-region links, then push outbound exactly once. Placing workers in the target region instead causes the source provider to bill egress to a destination that is "external" (sometimes the same line item, sometimes more expensive), and then the bytes still have to cross to the target. Place the *coordinator* near the *target* (so manifest commits, which are the only correctness-critical writes, have low latency to the target store), and place *workers* near the *source* (where bandwidth is free or cheap to pull). This is configurable and is the documented default.
 
-For mirrors within the same provider, place workers anywhere — provider-native `CopyObject` does all the work server-side at the source.
+For mirrors within the same provider, place workers anywhere — provider-native `CopyObject` does all the work server-side at the source. (Note that same-provider *cross-region* `CopyObject` still incurs the provider's inter-region transfer charge; only same-region copies are transfer-free. The mirror never pays the per-worker *stream-through* hop in either case.)
+
+## Cost Observability and Guardrails
+
+A cost-effective system is one whose cost is *visible* and *bounded*, not merely low on the happy path. The mirror treats spend as a first-class observable and refuses to let a cost control ever compromise correctness.
+
+- **Costed dry-run.** `s3e-mirror plan` reports not just planned bytes but a full estimate: egress GiB × per-GiB rate, Class A/B request counts × per-request rate, the storage delta and its per-tier monthly cost, and the retention overhang. Rates come from an operator-owned, provider-keyed price table (`[cost.prices]`) with conservative dated defaults and a link to each provider's calculator. **Pricing is never hard-coded into logic** — only into a config table the operator owns — so price drift is a config edit, not a code change.
+- **Cost metrics.** Beyond `s3e_mirror_egress_bytes_total`, the mirror exports `s3e_mirror_class_a_requests_total{provider,op}`, `s3e_mirror_class_b_requests_total{provider,op}`, `s3e_mirror_storage_bytes{class}`, and a derived `s3e_mirror_estimated_cost_usd{line_item}` so a dashboard shows the live bill decomposed into transfer / requests / storage / compute.
+- **Budget guardrail.** An optional `[cost.budget]` sets daily/monthly soft and hard ceilings. Crossing the soft ceiling raises an alert; crossing the hard ceiling pauses *new* snapshot planning — **never an in-flight commit; the two-phase rule and target validity are never sacrificed for cost** — and writes an audit event. This converts a runaway (a coalescing misconfiguration that re-copies the world, a control-plane write storm, an accidental dual-mirror doubling egress) from a surprise invoice into a paged, bounded incident. Resume is automatic once spend falls back under the ceiling or the operator raises it.
+- **Anomaly detection.** A sustained deviation of egress-per-source-byte or PUTs-per-file from their historical baseline is alerted: in a healthy mirror each source byte egresses ~once and each file yields a small, stable number of control-plane writes. A spike means re-copy, retry storms, or a bug — worth catching in hours rather than at month-end. This is the same per-byte ratio that distinguishes a benign cold-start seed (high absolute spend, normal ratio) from a genuine runaway (abnormal ratio).
+
+Cost appears in both the [§ Failure Matrix](#failure-matrix) and the [§ Operational Runbooks](#operational-runbooks), so a spend anomaly has the same documented detection-and-response path as any correctness failure.
 
 ## Adaptive Concurrency
 
@@ -805,6 +950,8 @@ Polling-only freshness is bounded by `manifest_poll_interval` (default 5 seconds
 - **AWS S3 → EventBridge → SQS**: configured on the source bucket, filter for `s3:ObjectCreated:*` on the `manifest/` prefix and (optionally) the `wal/` prefix. The coordinator consumes the SQS queue and reacts immediately.
 - **Azure Blob → Event Grid → Storage Queue or Webhook**: same pattern; filter by prefix.
 - **GCS → Pub/Sub**: same pattern via Pub/Sub notifications on the bucket.
+
+**Cost of the wake-up path.** Notification services bill per message (SQS ~$0.40/M, EventBridge ~$1/M, Event Grid ~$0.60/M, Pub/Sub by data volume) while polling bills per `LIST` (~$0.005/1k). For freshness, the trade-off is clear-cut; for cost it is not, and the default reflects that: **subscribe the low-volume `manifest/` prefix only.** WAL-prefix events are higher-volume (one per flushed WAL SST) and are enabled only for `sustained-latency` mode, where the freshness is worth the per-message charge. Polling at the default 5 s interval is itself cheap (~17k `LIST`/day ≈ pennies); aggressive sub-second polling is *not* recommended as a substitute for events because `LIST` volume then rivals the notification cost without the latency benefit. The upstream `manifest/CURRENT` tip-pointer ([Part XI item 2](#2-manifest-tip-pointer-file)) would further cut steady-state poll cost by turning each poll's `LIST` into a single `GET`.
 
 Events are **purely a wake-up signal**. The coordinator always reads the actual manifest list to determine truth; events that arrive out of order or get duplicated cannot affect correctness, only latency. Polling remains on as a fallback so that a misconfigured or temporarily-broken event channel only degrades freshness, never breaks the mirror.
 
@@ -876,18 +1023,51 @@ presence_filter_capacity = 10_000_000  # fingerprint slots; ~80 MiB at this size
 presence_filter_fpp      = 0.005       # ~0.5% false positive rate; drives HEAD call volume
 
 [worker]
-count                = 16
+count                = 16             # autoscaler target ceiling; see min_count/max_count
 in_flight_per_worker = 8              # initial; adaptive
 multipart_threshold_bytes = 67108864
 multipart_part_bytes      = 16777216
 placement_hint       = "source_region"
 temp_chunk_threshold_bytes = 536870912  # 500 MiB; files larger than this use temp-chunk staging
 temp_chunk_part_bytes      = 67108864  # 64 MiB per chunk part
+capacity_type        = "spot"         # spot | on_demand; workers are crash-safe, so default to spot
+min_count            = 0              # scale to zero when idle (snapshot mode / between bursts)
+max_count            = 64
+scale_to_zero        = true
+arch_hint            = "arm64"        # prefer cheaper ARM/Graviton-class instances
+
+[storage]                            # Portable storage-class tiering, mapped per provider
+compacted_class      = "cold"        # hot | cool | cold | archive  (live compacted bulk; instant-retrieval)
+wal_class            = "hot"         # WAL churns fast; keep hot to avoid min-duration penalties
+control_plane_class  = "hot"         # mirror_state/ is tiny and hot-path; never tier
+superseded_class     = "archive"     # retained-but-not-latest sets may use async archive
+min_tier_bytes       = 131072        # 128 KiB; never tier objects below the min billable size
+tier_after_hours     = 24            # settle window; avoid early-deletion penalties
+use_provider_autotier = false        # S3 Intelligent-Tiering / GCS Autoclass; off (per-object fee)
+
+[network]
+require_private_endpoint = true      # GET source via gateway/private endpoint, not metered NAT
+egress_via_internet_gateway = true   # cross-cloud PUT avoids NAT data-processing charge
+single_zone_workers = true           # avoid inter-AZ transfer on the in-region leg
+preflight_nat_check = true           # fail/alert at startup if store traffic would traverse a metered NAT
+
+[control_plane]                      # CRDT write-coalescing; see § Control-Plane Request Cost
+batch_max_facts      = 256           # flush a segment after this many facts
+batch_max_ms         = 1000          # ...or this long, whichever first
+counter_flush_ms     = 10000         # counters flush on a timer, never per-increment
+
+[lifecycle]                          # Provider-native cleanup; server-side, zero Class A cost
+enable_provider_rules     = true
+incomplete_mpu_abort_hours = 24
+temp_chunk_ttl_hours       = 48
+
+[verify]
+deep_sample_rate     = 0.001         # level-3 rolling sample; reads bytes, so a cost knob on cold tiers (0 = off)
 
 [target_gc]                          # Mirror-aware GC; off by default
 enabled = false
 retain_window_hours = 24
-retain_manifest_count = 1024
+retain_manifest_count = 1024          # DOMINANT storage knob: size to actual PITR need, not the max
 find_orphans = false                  # expensive deep scan, opt-in
 
 [schema]
@@ -903,15 +1083,33 @@ dedupe_window_secs = 300
 metrics_endpoint = "0.0.0.0:9090"
 log_level        = "info"
 redact_manifest_uris = true
+
+[cost]                               # Drives the costed dry-run, cost metrics, and guardrail
+[cost.prices]                        # Operator-owned; pricing is config, never hard-coded in logic
+egress_usd_per_gib      = 0.09       # provider/region/commit dependent; stamp & refresh periodically
+class_a_usd_per_1k      = 0.005      # PUT / COPY / POST / LIST
+class_b_usd_per_1k      = 0.0004     # GET / HEAD
+prices_dated            = "2026-06-01"  # warn if older than a threshold
+[cost.prices.storage_usd_per_gib_month]
+hot     = 0.023
+cool    = 0.0125
+cold    = 0.004
+archive = 0.001
+[cost.budget]                        # 0 = disabled. Hard ceiling pauses NEW planning only.
+daily_soft_usd   = 0
+daily_hard_usd   = 0
+monthly_soft_usd = 0
+monthly_hard_usd = 0
 ```
 
 ## CLI
 
 ```text
 s3e-mirror init     --config s3e-mirror.toml
-s3e-mirror plan     --config s3e-mirror.toml     # dry-run; emits planned bytes & cost
+s3e-mirror plan     --config s3e-mirror.toml     # dry-run; emits planned bytes, requests, storage delta & full $ estimate
 s3e-mirror run      --config s3e-mirror.toml
-s3e-mirror status   --config s3e-mirror.toml     # shows lag, queue depth, last commit
+s3e-mirror status   --config s3e-mirror.toml     # shows lag, queue depth, last commit, retention storage overhang
+s3e-mirror cost     --config s3e-mirror.toml [--forecast]  # live spend decomposed: transfer/requests/storage/compute
 s3e-mirror verify   --config s3e-mirror.toml --level 1|2|3|4|5
 s3e-mirror verify-fences --config s3e-mirror.toml
 s3e-mirror verify-gc-fencing --config s3e-mirror.toml
@@ -972,6 +1170,22 @@ The mirror exposes Prometheus-style metrics:
 - `s3e_mirror_temp_chunk_parts_uploaded_total` (counter; individual chunk parts successfully uploaded to temp staging area)
 - `s3e_mirror_temp_chunk_compose_seconds` (histogram; time to execute provider-native compose call)
 - `s3e_mirror_temp_chunk_orphan_parts_total` (counter; temp chunk objects found by orphan detection with no reachable parent job)
+- `s3e_mirror_class_a_requests_total{provider,op}` (counter; PUT/COPY/POST/LIST — the expensive request class)
+- `s3e_mirror_class_b_requests_total{provider,op}` (counter; GET/HEAD)
+- `s3e_mirror_control_plane_puts_total{subtree}` (counter; control-plane writes, the request-cost lever)
+- `s3e_mirror_control_plane_facts_per_segment` (histogram; batching effectiveness — higher is cheaper)
+- `s3e_mirror_control_plane_list_requests_total` (counter; LISTs for state reconstruction/compaction)
+- `s3e_mirror_storage_bytes{class}` (gauge; bytes resident per portable storage class)
+- `s3e_mirror_objects_by_storage_class{class}` (gauge)
+- `s3e_mirror_lifecycle_transitions_total{from,to}` (counter; server-side tier transitions)
+- `s3e_mirror_cold_tier_retrieval_bytes_total` (counter; bytes read back from cool/cold — the retrieval-fee driver)
+- `s3e_mirror_retained_superseded_bytes` (gauge; bytes kept alive solely by retention, not by the latest manifest)
+- `s3e_mirror_retained_manifest_count` (gauge)
+- `s3e_mirror_worker_count{capacity_type}` (gauge; spot vs on_demand workers in the pool)
+- `s3e_mirror_worker_spot_reclaims_total` (counter; spot interruptions — each handled as an ordinary worker crash)
+- `s3e_mirror_worker_idle_seconds_total` (counter; informs scale-to-zero tuning)
+- `s3e_mirror_worker_nat_suspected_total` (counter; pre-flight flag that store traffic would traverse a metered NAT)
+- `s3e_mirror_estimated_cost_usd{line_item}` (gauge; live bill decomposed into transfer/requests/storage/compute)
 
 Logs are structured JSON, never include manifest payloads verbatim (the manifest may contain URIs with credentials in older V1 schemas), and are redacted by default.
 
@@ -1075,6 +1289,7 @@ These are the first actions an on-call operator should take. They are intentiona
 | Worker pool down | `s3e_mirror_worker_in_flight == 0` and `s3e_mirror_queue_depth > 0` | worker logs: auth, network, resource pressure | restart workers; claims expire automatically; do not touch manifests |
 | Dual mirror conflict | second mirror exits on lease create failure | which source/target pair is intended | revoke credentials for wrong mirror, verify survivor, keep target read-only until quiet |
 | Conditional-write storm | conflict/transient counters spike | same-bytes vs mismatch, provider status, recent deploy | same-bytes conflicts are benign; mismatch halts; transients trigger backoff and provider quota check |
+| Cost spike / budget alert | `[cost.budget]` soft ceiling or cost-anomaly alert | line item via `s3e_mirror_estimated_cost_usd`; egress-per-source-byte and PUTs-per-file vs baseline; dual-mirror; coalescing churn; NAT route | hard ceiling auto-pauses new planning (target stays valid); benign cold-start seed (normal per-byte ratio) vs runaway (abnormal ratio); fix driver, then resume |
 
 No runbook step asks an operator to edit manifests by hand. Manual object-store surgery is limited to revoking credentials, increasing TTLs, restarting processes, or deleting stale temp uploads after `verify --find-orphans` confirms they are unreachable.
 
@@ -1335,8 +1550,8 @@ We ship in two tracks simultaneously:
 - **Phase 1 — Read-only source enumeration.** Implement `s3e-mirror-slate` against the public APIs. Enumerate the source. Produce a plan in dry-run mode. No writes anywhere.
 - **Phase 2 — Cold start to local target.** Implement workers, queue, and the bulk-copy path against an `InMemory` and local-disk target. End-to-end tests pass: source database opens, target database opens with identical keys.
 - **Phase 3 — Continuous tail.** Implement the coordinator's polling loop, plan diffing, and incremental commit. Source-rewind detection. Lease and fencing.
-- **Phase 4 — Cross-cloud.** Real S3 and Azure backends. WAL prefetch. Adaptive concurrency. Cost-model instrumentation.
-- **Phase 5 — Event-driven tail + operations.** EventBridge/Event Grid/Pub-Sub integration. Promotion CLI. Mirror-aware GC. Verification levels. **Copy ledger** (OR-Map by `(file, target)`) and **anti-entropy repair** (worker pool drains repair observations) — see [ideas/crdts.md](ideas/crdts.md).
+- **Phase 4 — Cross-cloud.** Real S3 and Azure backends. WAL prefetch. Adaptive concurrency. Cost-model instrumentation. **FinOps baseline:** portable storage-class tiering and provider-native lifecycle rules, spot/preemptible worker pool with autoscale-to-zero, ARM worker images, and pre-flight NAT/private-endpoint network-path checks.
+- **Phase 5 — Event-driven tail + operations.** EventBridge/Event Grid/Pub-Sub integration. Promotion CLI. Mirror-aware GC. Verification levels. **Copy ledger** (OR-Map by `(file, target)`) and **anti-entropy repair** (worker pool drains repair observations) — see [ideas/crdts.md](ideas/crdts.md). **Cost observability:** costed dry-run, decomposed cost metrics, `s3e-mirror cost`, and the `[cost.budget]` guardrail. **Control-plane write-coalescing** (segment batching) on by default.
 - **Phase 6 — Advanced.** Per-backend distributed multipart for S3. Provider-native fast paths fully wired. Pluggable digest algorithms. Snapshot-bundle ingest once SlateDB ships item 8. **Distributed temp-chunk staging** enabled by default (see [§ Distributed Temp-Chunk Staging](#distributed-temp-chunk-staging)); GCS two-level compose tree and S3 `UploadPartCopy`-based assembly. **Dead-copy elimination** on by default with configurable obsolescence window. **Target presence filter** (Cuckoo Filter) on by default; capacity auto-tuned from copy-ledger checkpoint size. **Progress vectors** persisted as CRDT facts; **coordinator standby** that reconstructs state and dry-runs deterministic plans for fast failover.
 - **Phase 7 — Multi-coordinator HA and multi-target fan-out.** Two or more coordinator replicas race to commit *identical* deterministic target manifest bytes; `PutMode::Create` picks the winner and same-bytes-on-conflict verification guarantees safety. One source checkpoint protects copies to multiple independent targets, each with its own target manifest commit and progress vector — enabled by the copy-ledger's `(file, target)` keying.
 - **Phase 8 — Research.** Active-active RockLake (out of scope for the one-way mirror; requires upstream RockLake changes — globally unique snapshot/operation IDs, schema conflict policy). Tracked separately.
@@ -1367,13 +1582,14 @@ These are the questions we do not yet have a confident answer to. Each one is a 
 3. **Mirror-of-mirror.** Can a target serve as the source for *another* mirror? In principle yes — the target is a valid SlateDB database — but the chained replication slot semantics need more thought.
 4. **Promotion symmetry.** When the target is promoted, do we expect operators to reverse the mirror automatically (so the old source becomes the new mirror's target), or is that always a manual decision? Default proposal: manual, with `s3e-mirror reverse` as a documented convenience.
 5. **Tenancy.** Can one s3e-mirror coordinator manage multiple source/target pairs, or is the unit always one process per pair? Default proposal: one process per pair for v1, multi-tenant a Phase 7 concern.
-6. **Network egress observability.** Should we ship an opinionated "this is what your cloud bill will look like next month" estimator? It is genuinely useful and operators will ask, but it is also a maintenance burden as cloud pricing drifts. Default proposal: ship a coarse model with caveats, link to the provider's calculator for ground truth.
+6. **Cost estimation and price-table maintenance.** The mirror now ships a costed dry-run, decomposed cost metrics, and a budget guardrail ([§ Cost Observability and Guardrails](#cost-observability-and-guardrails)), all driven by an operator-owned `[cost.prices]` table rather than hard-coded rates. The open question is process, not capability: do we ship and periodically refresh a best-effort default price table per provider/region (convenient, but a maintenance burden as pricing drifts), or always require the operator to supply rates and only link to each provider's calculator for ground truth? Default proposal: ship conservative defaults, stamp them with a date (`prices_dated`), and warn when they are older than a threshold.
 7. **Schema-change notification from SlateDB upstream.** The mirror now fails closed on unknown manifest versions and carries a golden corpus. The open question is process: how do we get alerted within hours when SlateDB lands a manifest schema change so the corpus and vendored codec can be updated before users upgrade sources?
 8. **CRDT compaction cadence.** Default proposal: **every 15 minutes**, plus on-demand when `s3e_mirror_crdt_state_object_count` exceeds 50k per type. Target invariant: `s3e_mirror_crdt_tail_object_count` stays below 5k under normal operation, so cold-restart tail LIST completes in under 2 seconds. See [§ CRDT State Cold-Restart Performance](#crdt-state-cold-restart-performance) and [ideas/crdts.md § Part VII Operational Concerns](ideas/crdts.md).
 9. **IAM scoping policy.** Should the default deployment ship IAM templates that scope worker credentials to `mirror_state/jobs/claims/` + `jobs/acks/` + target object paths only, leaving manifest commits to coordinator credentials? Strongly leaning yes; documented in the security appendix of [ideas/crdts.md](ideas/crdts.md).
+10. **Storage-tier aggressiveness vs promotion/verify retrieval cost.** Tiering the live compacted bulk into `cold` (instant-retrieval) saves ~80% on storage but adds a per-GiB retrieval fee whenever that data is actually read — chiefly at promotion and full deep-verify. For a mirror promoted rarely this is overwhelmingly worth it; for one that deep-verifies its entire set frequently it may not be. Default proposal: `cold` for the live compacted set with deep-verify sampling kept low; `cool` when frequent full verification is configured; and the trade-off surfaced in the costed dry-run so operators choose with the numbers in front of them. The related question is whether to auto-select the tier from the observed read rate rather than from static config.
 
 ---
 
 ## Bottom Line
 
-We can build a correct, fool-proof, cross-cloud SlateDB mirror against SlateDB v0.13.0 today, using only public APIs and a vendored copy of the manifest schema. The design above is conservative on safety — the two-phase rule and create-if-absent everywhere make worker crashes and lease takeover safe by construction — and aggressive on the operational details that catch real production mirrors out: source-side GC handshake, target-side GC prohibition, manifest-version skew, source rewinds, cross-region cost, adaptive concurrency, and event-driven freshness. The upstream wishlist in [Part XI](#part-xi--how-slatedb-could-help) is genuinely additive: each item makes the mirror smaller, faster, or safer, but none of them is required to ship.
+We can build a correct, fool-proof, cross-cloud SlateDB mirror against SlateDB v0.13.0 today, using only public APIs and a vendored copy of the manifest schema. The design above is conservative on safety — the two-phase rule and create-if-absent everywhere make worker crashes and lease takeover safe by construction — and aggressive on the operational details that catch real production mirrors out: source-side GC handshake, target-side GC prohibition, manifest-version skew, source rewinds, cross-region cost, adaptive concurrency, and event-driven freshness. It is also **disciplined on cost**: each byte egresses exactly once, the cold compacted bulk lives in cheap instant-retrieval storage tiers (never breaking read-openability), the control plane batches its own bookkeeping instead of writing an object per fact, workers run on reclaimable spot compute and scale to zero when idle, bulk traffic avoids the metered-NAT tax, and a budget guardrail turns any runaway into a bounded, paged incident rather than a surprise invoice — none of which costs the design any of its safety guarantees, and all of which works identically on AWS, Azure, and GCP. The upstream wishlist in [Part XI](#part-xi--how-slatedb-could-help) is genuinely additive: each item makes the mirror smaller, faster, cheaper, or safer, but none of them is required to ship.
